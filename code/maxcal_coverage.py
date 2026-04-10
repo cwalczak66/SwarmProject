@@ -422,7 +422,10 @@ def parse_args():
     parser.add_argument(
         "--outdir",
         type=str,
-        default="Figures",
+        default=os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "Figures"
+        ),
         help="Directory to save output figures (default: Figures)"
     )
     return parser.parse_args()

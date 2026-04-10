@@ -5,3 +5,5 @@ This project extends recent research on a theoretical decentralized framework ca
 ## How to run the code:
 Here we can put information on what to run, 
 `pip install -r requirements.txt`
+
+Right now, run the script maxcal_coverage.py in the Code directory. There is an optional argument: --outdir Figures that makes a directory to save the images in. The default is Figures. 
