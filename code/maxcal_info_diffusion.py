@@ -1,11 +1,11 @@
 """
-maxcal_coverage.py
+maxcal_info_diffusion.py
 
 SETUP:
     pip install numpy matplotlib pillow
 
 RUN:
-    python maxcal_coverage.py
+    python maxcal_info-diffusion.py
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ import os
 
 
 # ============================================================
-# PARAMETERS 
+# PARAMETERS - use the same as maxcal_ceverage
 # ============================================================
 
 NX = 20                  # grid columns
@@ -44,6 +44,7 @@ SEED = 42
 #   The stationary distribution is then π_k ∝ deg(k) (see §3).
 #   We keep the full formula so non-uniform λ_C^k slots in later.
 
+'''
 
 # ============================================================
 # 1.  WORLD MODEL
@@ -412,23 +413,25 @@ def make_animation(res: SimResult, fps: int = 12, filename: str = "maxcal_covera
         print(f"Could not save animation ({e}); skipping.")
     plt.close(fig)
 
-
+'''
+    
 # ============================================================
 # 7. PARSING ARGUMENTS
 # ============================================================
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="MaxCal Coverage Simulation")
+    parser = argparse.ArgumentParser(description="MaxCal Information Diffusion (convergence) Simulation")
     parser.add_argument(
         "--outdir",
         type=str,
         default=os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            "Figures/Coverage"
+            "Figures/InfoDiffusion"
         ),
         help="Directory to save output figures (default: Figures)"
     )
     return parser.parse_args()
+
 
 # ============================================================
 # 8. ENTRY POINT
@@ -441,38 +444,25 @@ def main():
     # Create directory if it doesn't exist
     os.makedirs(outdir, exist_ok=True)
 
-    print("MaxCal Coverage Simulation")
-    print(f"  Output  : {outdir}/")
-    print(f"  World   : {NX}x{NY} grid, cell={CELL_SIZE} m")
-    print(f"  Swarm   : {N_ROBOTS} robots, speed={ROBOT_SPEED} m/step")
-    print(f"  Duration: {T_SIM} steps")
-    print()
 
-    print("Running simulation...")
-    result = run_simulation()
-    print(f"  Done. Total Markov steps: {result.markov_step_history[-1]}")
-    print(f"  Expected per robot: ~{round(result.markov_step_history[-1] / N_ROBOTS)}")
-    print()
+    # # ---- Save outputs into directory ----
+    # main_path = os.path.join(outdir, "maxcal_coverage_main.png")
+    # gif_path = os.path.join(outdir, "maxcal_coverage.gif")
+    # phase_path = os.path.join(outdir, "maxcal_coverage_phase.png")
 
-    # ---- Save outputs into directory ----
-    main_path = os.path.join(outdir, "maxcal_coverage_main.png")
-    gif_path = os.path.join(outdir, "maxcal_coverage.gif")
-    phase_path = os.path.join(outdir, "maxcal_coverage_phase.png")
+    # print(f"Saving main figure → {main_path}")
+    # fig_main = make_main_figure(result)
+    # fig_main.savefig(main_path, dpi=120)
+    # plt.close(fig_main)
 
-    print(f"Saving main figure → {main_path}")
-    fig_main = make_main_figure(result)
-    fig_main.savefig(main_path, dpi=120)
-    plt.close(fig_main)
+    # print(f"Saving animation → {gif_path}")
+    # make_animation(result, filename=gif_path)
 
-    print(f"Saving animation → {gif_path}")
-    make_animation(result, filename=gif_path)
-
-    print("Saving phase diagram (runs 5 additional simulations)...")
-    fig_phase = make_phase_figure()
-    fig_phase.savefig(phase_path, dpi=120)
-    plt.close(fig_phase)
-    print(f"  Saved {phase_path}")
-
+    # print("Saving phase diagram (runs 5 additional simulations)...")
+    # fig_phase = make_phase_figure()
+    # fig_phase.savefig(phase_path, dpi=120)
+    # plt.close(fig_phase)
+    # print(f"  Saved {phase_path}")
 
 if __name__ == "__main__":
     main()
