@@ -119,18 +119,20 @@ def sample_next_region(w: World, k: int, P: np.ndarray, rng: np.random.Generator
             return nb[i]
     return nb[-1]   # fallback for floating-point edge case
 
+
+
 #TODO: change this for diffusion, each timestep we want to increase prob of moving to cluster
-def sample_next_region_diffusion(w,k,lambda_C,lambda_I,density,rng):
-    #  neighbors = w.adjacency[k]
+def sample_next_region_diffusion(w,k,lambda_C,lambda_I,pi_bar,rng):
+    neighbors = w.adjacency[k]
     
-    # scores = np.exp(
-    #     -lambda_C[neighbors]
-    #     -lambda_I * density[neighbors]
-    # )
+    scores = np.exp(
+        -lambda_C[neighbors]
+        -lambda_I * pi_bar[neighbors]
+    )
     
-    # probs = scores / scores.sum()
-    # return rng.choice(neighbors, p=probs)
-    pass
+    probs = scores / scores.sum()
+    return rng.choice(neighbors, p=probs)
+
 
 # ============================================================
 # 3. THEORETICAL STATIONARY DISTRIBUTION
@@ -230,6 +232,41 @@ def step_robot(r: Robot, w: World, P: np.ndarray,
         r.to_k = next_k
         r.tx, r.ty = region_center(w, next_k)
 
+def step_robot_diff(r: Robot, w: World, pi_bar,
+               speed: float, markov_visits: np.ndarray,
+               rng: np.random.Generator, lC, lI) -> None:
+    dx = r.tx - r.x
+    dy = r.ty - r.y
+    dist = math.sqrt(dx * dx + dy * dy)
+
+    # ── IN TRANSIT: capped movement ──────────────────────────
+    move = min(speed, dist)
+    # Move toward target; never overshoot.
+    if dist > 1e-10:
+        r.x += move * dx / dist
+        r.y += move * dy / dist
+
+    # ── ARRIVAL TEST ─────────────────────────────────────────
+    # Position matches target to floating-point precision.
+    if abs(r.x - r.tx) < 1e-9 and abs(r.y - r.ty) < 1e-9:
+        
+        # Update Markov state
+        r.from_k = r.to_k
+
+        # Record arrival — this is the "visit" counted in c_k(t):
+        #   c_k(t) = (# arrivals at k up to Markov-time t) / (total arrivals)
+        markov_visits[r.from_k] += 1
+
+        # ── MAXCAL TRANSITION: sample p*(k2 | from_k), Eq.(1) ───
+        
+        #TODO: change this to sample_next_region for diffusion
+        #next_k = sample_next_region(w, r.from_k, P, rng)
+       # lambda_C = np.full(w.K, 0.0)
+        next_k = sample_next_region_diffusion(w,r.from_k,lC,lI,pi_bar,rng)
+        
+        r.to_k = next_k
+        r.tx, r.ty = region_center(w, next_k)
+
 
 # ============================================================
 # 5.  MAIN SIMULATION
@@ -242,13 +279,28 @@ class SimResult:
     ck_history: List[np.ndarray]                              # c_k(t) snapshots
     markov_step_history: List[int]                            # total arrivals at each snapshot
     pos_snapshots: List[Tuple[np.ndarray, np.ndarray, int]]   # (xs, ys, t)
+    encounter_rates: List[float]
 
-# God-Like function to compute density at each grid cell
+# God Like function to compute density at each grid cell
 def compute_density(w, robots):
-    density = np.zeros(w.K)
-    for r in robots:
-        density[r.from_k] += 1
-    return density / len(robots)  # normalize
+    # density = np.zeros(w.K)
+    # for r in robots:
+    #     density[r.from_k] += 1
+    # # return density / len(robots)  # normalize
+    # return density 
+    pass
+
+def compute_pi_bar(markov_visits):
+    total = markov_visits.sum()
+    
+    if total == 0:
+        # early stage: no visits yet → uniform
+        return np.ones_like(markov_visits) / len(markov_visits)
+    
+    return markov_visits / total
+
+def compute_encounter_rate(pi_bar):
+    return np.sum(pi_bar ** 2)
 
 def run_simulation(speed: float = ROBOT_SPEED,
                    T: int = T_SIM,
@@ -257,10 +309,10 @@ def run_simulation(speed: float = ROBOT_SPEED,
     rng = np.random.default_rng(seed)
     w = build_world(NX, NY, CELL_SIZE)
     lambda_C = np.full(w.K, lambda_C_val)
-    lambda_I = 0.003 # new parameter to control diffusion strength?
+    lambda_I = -67.0 # new parameter to control diffusion strength?
    
     # TODO: do this once in the beginning
-    P = build_transition_matrix(w, lambda_C, lambda_I, density) 
+    P = build_transition_matrix(w, lambda_C) 
 
     # should accept 
     robots = [make_robot(i, w, P, rng) for i in range(N_ROBOTS)]
@@ -269,12 +321,19 @@ def run_simulation(speed: float = ROBOT_SPEED,
     ms_history: List[int] = []
     pos_snapshots: List[Tuple[np.ndarray, np.ndarray, int]] = []
     
-    density = compute_density(w, robots)
+    
 
-
+    encounter_rates = []
     for t in range(1, T + 1):
+        #density = compute_density(w, robots)
+        pi_bar = compute_pi_bar(markov_visits)
+        enc_rate = compute_encounter_rate(pi_bar)
+        encounter_rates.append(enc_rate)
+
+        print("total visits:", markov_visits.sum())
+        
         for r in robots:
-            step_robot(r, w, P, speed, markov_visits, rng) #TODO: update robot using density not P
+            step_robot_diff(r, w, pi_bar, speed, markov_visits, rng, lambda_C, lambda_I) #TODO: update robot using density not P
 
         total = int(markov_visits.sum())
         if t % RECORD_EVERY == 0 and total > 0:
@@ -287,13 +346,24 @@ def run_simulation(speed: float = ROBOT_SPEED,
             pos_snapshots.append((xs, ys, t))
 
     pi_emp = markov_visits / markov_visits.sum()
-    return SimResult(w, pi_emp, ck_history, ms_history, pos_snapshots)
+    return SimResult(w, pi_emp, ck_history, ms_history, pos_snapshots, encounter_rates)
 
 
 # ============================================================
 # 6. VISUALISATION
 # ============================================================
+def make_encounter_plot(res: SimResult):
+    fig, ax = plt.subplots(figsize=(6, 4))
 
+    timesteps = np.arange(len(res.encounter_rates))
+
+    ax.plot(timesteps, res.encounter_rates, lw=2)
+
+    ax.set_title("Encounter Rate Over Time")
+    ax.set_xlabel("Simulation Step")
+    ax.set_ylabel("Encounter Rate (Σ π̄_k²)")
+
+    return fig
 def make_main_figure(res: SimResult):
     w = res.w
     pi_theory = theoretical_stationary(w)
@@ -411,7 +481,7 @@ def make_phase_figure(T: int = T_SIM):
     return fig
 
 
-def make_animation(res: SimResult, fps: int = 12, filename: str = "maxcal_coverage.gif"):
+def make_animation(res: SimResult, fps: int = 12, filename: str = "maxcal_info_diff.gif"):
     w = res.w
     pi_theory = theoretical_stationary(w)
     bg = pi_theory.reshape(w.Ny, w.Nx)
@@ -454,7 +524,7 @@ def parse_args():
         type=str,
         default=os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            "Figures/Coverage"
+            "Figures/InfoDiff"
         ),
         help="Directory to save output figures (default: Figures)"
     )
@@ -485,8 +555,8 @@ def main():
     print()
 
     # ---- Save outputs into directory ----
-    main_path = os.path.join(outdir, "maxcal_coverage_main.png")
-    gif_path = os.path.join(outdir, "maxcal_coverage.gif")
+    main_path = os.path.join(outdir, "maxcal_info_diff_main.png")
+    gif_path = os.path.join(outdir, "maxcal_info_diff.gif")
     phase_path = os.path.join(outdir, "maxcal_coverage_phase.png")
 
     print(f"Saving main figure → {main_path}")
@@ -497,11 +567,18 @@ def main():
     print(f"Saving animation → {gif_path}")
     make_animation(result, filename=gif_path)
 
-    print("Saving phase diagram (runs 5 additional simulations)...")
-    fig_phase = make_phase_figure()
-    fig_phase.savefig(phase_path, dpi=120)
-    plt.close(fig_phase)
-    print(f"  Saved {phase_path}")
+    enc_path = os.path.join(outdir, "encounter_rate.png")
+
+    print(f"Saving encounter plot → {enc_path}")
+    fig_enc = make_encounter_plot(result)
+    fig_enc.savefig(enc_path, dpi=120)
+    plt.close(fig_enc)
+
+    # print("Saving phase diagram (runs 5 additional simulations)...")
+    # fig_phase = make_phase_figure()
+    # fig_phase.savefig(phase_path, dpi=120)
+    # plt.close(fig_phase)
+    # print(f"  Saved {phase_path}")
 
 
 if __name__ == "__main__":
