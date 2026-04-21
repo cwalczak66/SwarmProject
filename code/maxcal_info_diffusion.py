@@ -76,7 +76,7 @@ LAMBDA_I_VAL = 10.0        # Testing with negative and positive 10 give the oppo
 
 # Gate parameters.
 A_HALF = 1.0  # Half-age for the information gate g(A_I) = A_I / (A_I + A_half). This controls how quickly
-R_MEET = 1.0  # Meeting radius for information refreshment and encounter counting.
+R_MEET = 1.5  # Meeting radius for information refreshment and encounter counting.
 
 # Sweep used by the standalone script.
 LAMBDA_I_SWEEP = (-10.0, -8.0, -4.0, -2.0, 0.0, 2.0, 4.0, 8.0, 10.0)
@@ -194,8 +194,7 @@ def local_transition_probabilities(
 ) -> Tuple[np.ndarray, np.ndarray]:
     neighbors = np.array(w.adjacency[k1], dtype=np.int64)
     gate = info_gate(info_age)
-    #effective_cost = lambda_C[neighbors] + gate * lambda_I_value * info_field[neighbors]
-    effective_cost = lambda_C[neighbors] + lambda_I_value * info_field[neighbors]
+    effective_cost = lambda_C[neighbors] + gate * lambda_I_value * info_field[neighbors]
     shifted = effective_cost - effective_cost.min()
     scores = np.exp(-shifted)
     probs = scores / scores.sum()
