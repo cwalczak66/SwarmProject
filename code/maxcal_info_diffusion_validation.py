@@ -68,6 +68,22 @@ class SignSweepPoint:
     interior_visit_probability: float
 
 
+@dataclass
+class InformationSpreadPoint:
+    lambda_I_value: float
+    final_informed_fraction: float
+    time_to_50_percent: int | None
+    time_to_90_percent: int | None
+    time_to_all_informed: int | None
+    total_meetings: int
+    meeting_cells_visited: int
+    mean_meeting_distance_from_center: float
+    total_transmission_events: int
+    transmission_cells_visited: int
+    mean_transmission_distance_from_center: float
+    transmission_efficiency: float
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Validate information diffusion Layer 1-I.")
     parser.add_argument(
@@ -87,6 +103,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=12_000,
         help="Simulation length for the closed-loop preview runs.",
+    )
+    parser.add_argument(
+        "--spread-T",
+        type=int,
+        default=6_000,
+        help="Simulation length for the informed-robot spread validation.",
     )
     parser.add_argument(
         "--seed",
@@ -355,6 +377,194 @@ def stage2_preview(T: int, seed: int) -> Dict[str, object]:
     }
 
 
+def _meeting_pairs(robots: Sequence[mid.Robot], r_meet: float) -> List[tuple[int, int, float, float]]:
+    pairs: List[tuple[int, int, float, float]] = []
+    xs = np.array([r.x for r in robots], dtype=np.float64)
+    ys = np.array([r.y for r in robots], dtype=np.float64)
+    for i in range(len(robots)):
+        dx = xs[i + 1:] - xs[i]
+        dy = ys[i + 1:] - ys[i]
+        hits = np.where(dx * dx + dy * dy <= r_meet * r_meet)[0]
+        for j_off in hits:
+            j = i + 1 + int(j_off)
+            pairs.append((i, j, 0.5 * (xs[i] + xs[j]), 0.5 * (ys[i] + ys[j])))
+    return pairs
+
+
+def _threshold_time(t_axis: Sequence[int], fractions: Sequence[float], threshold: float) -> int | None:
+    for t, frac in zip(t_axis, fractions):
+        if frac >= threshold:
+            return int(t)
+    return None
+
+
+def run_information_spread_case(
+    T: int,
+    lambda_I_value: float,
+    seed: int,
+    n_initial_informed: int = 1,
+) -> tuple[InformationSpreadPoint, Dict[str, np.ndarray]]:
+    """
+    Track information diffusion directly as a robot-level contagion process.
+
+    A small set of initially informed robots carries a binary information flag.
+    When an informed robot meets an uninformed robot, the uninformed robot becomes
+    informed. This validation is intentionally separate from coverage maps:
+    the primary observable is the fraction of informed robots over time, and the
+    spatial diagnostic is where transmission meetings occur.
+    """
+    rng = np.random.default_rng(seed)
+    w = mid.build_world(mid.NX, mid.NY, mid.CELL_SIZE)
+    lambda_c = mid.build_lambda_C(w, mid.LAMBDA_C_VAL)
+    robots = [mid.make_robot(i, w, rng, fixed_initial_info_age=None) for i in range(mid.N_ROBOTS)]
+    mid.initialise_targets(robots, w, lambda_c, lambda_I_value, rng)
+
+    informed = np.zeros(mid.N_ROBOTS, dtype=bool)
+    informed[:n_initial_informed] = True
+    markov_visits = np.zeros(w.K, dtype=np.int64)
+    coverage_age_field = np.zeros(w.K, dtype=np.float64)
+
+    t_axis: List[int] = []
+    informed_fraction: List[float] = []
+    cumulative_meetings: List[int] = []
+    cumulative_transmissions: List[int] = []
+    meetings_per_interval: List[int] = []
+    transmissions_per_interval: List[int] = []
+    meeting_heatmap = np.zeros(w.K, dtype=np.float64)
+    transmission_heatmap = np.zeros(w.K, dtype=np.float64)
+    total_meetings = 0
+    total_transmissions = 0
+    interval_meetings = 0
+    interval_transmissions = 0
+
+    for t in range(1, T + 1):
+        info_field = mid.compute_information_field(w, robots)
+        for r in robots:
+            mid.step_robot(
+                r=r,
+                w=w,
+                lambda_C=lambda_c,
+                lambda_I_value=lambda_I_value,
+                info_field=info_field,
+                speed=mid.ROBOT_SPEED,
+                markov_visits=markov_visits,
+                coverage_age_field=coverage_age_field,
+                t=t,
+                rng=rng,
+                freeze_info_age=False,
+            )
+
+        for i, j, mx, my in _meeting_pairs(robots, mid.R_MEET):
+            total_meetings += 1
+            interval_meetings += 1
+            cell = mid.position_to_cell(w, mx, my)
+            meeting_heatmap[cell] += 1.0
+            before_i = bool(informed[i])
+            before_j = bool(informed[j])
+            if before_i or before_j:
+                informed[i] = True
+                informed[j] = True
+            if before_i != before_j:
+                total_transmissions += 1
+                interval_transmissions += 1
+                transmission_heatmap[cell] += 1.0
+            robots[i].info_age = 0.0
+            robots[j].info_age = 0.0
+            robots[i].last_meet = t
+            robots[j].last_meet = t
+
+        if t % mid.RECORD_EVERY == 0 or t == T:
+            t_axis.append(t)
+            informed_fraction.append(float(informed.mean()))
+            cumulative_meetings.append(total_meetings)
+            cumulative_transmissions.append(total_transmissions)
+            meetings_per_interval.append(interval_meetings)
+            transmissions_per_interval.append(interval_transmissions)
+            interval_meetings = 0
+            interval_transmissions = 0
+
+    centers = w.centers
+    center_xy = np.array([0.5 * w.Nx * w.cell_size, 0.5 * w.Ny * w.cell_size])
+    meeting_cells = np.where(meeting_heatmap > 0)[0]
+    transmission_cells = np.where(transmission_heatmap > 0)[0]
+    if len(meeting_cells) > 0:
+        meeting_weights = meeting_heatmap[meeting_cells]
+        meeting_distances = np.linalg.norm(centers[meeting_cells] - center_xy, axis=1)
+        mean_meeting_distance = float(np.average(meeting_distances, weights=meeting_weights))
+    else:
+        mean_meeting_distance = float("nan")
+    if len(transmission_cells) > 0:
+        weights = transmission_heatmap[transmission_cells]
+        distances = np.linalg.norm(centers[transmission_cells] - center_xy, axis=1)
+        mean_transmission_distance = float(np.average(distances, weights=weights))
+    else:
+        mean_transmission_distance = float("nan")
+    transmission_efficiency = float(total_transmissions / total_meetings) if total_meetings > 0 else 0.0
+
+    point = InformationSpreadPoint(
+        lambda_I_value=float(lambda_I_value),
+        final_informed_fraction=float(informed_fraction[-1]),
+        time_to_50_percent=_threshold_time(t_axis, informed_fraction, 0.50),
+        time_to_90_percent=_threshold_time(t_axis, informed_fraction, 0.90),
+        time_to_all_informed=_threshold_time(t_axis, informed_fraction, 1.00),
+        total_meetings=int(total_meetings),
+        meeting_cells_visited=int(len(meeting_cells)),
+        mean_meeting_distance_from_center=mean_meeting_distance,
+        total_transmission_events=int(total_transmissions),
+        transmission_cells_visited=int(len(transmission_cells)),
+        mean_transmission_distance_from_center=mean_transmission_distance,
+        transmission_efficiency=transmission_efficiency,
+    )
+    series = {
+        "t_axis": np.array(t_axis, dtype=np.int64),
+        "informed_fraction": np.array(informed_fraction, dtype=np.float64),
+        "cumulative_meetings": np.array(cumulative_meetings, dtype=np.int64),
+        "cumulative_transmissions": np.array(cumulative_transmissions, dtype=np.int64),
+        "meetings_per_interval": np.array(meetings_per_interval, dtype=np.int64),
+        "transmissions_per_interval": np.array(transmissions_per_interval, dtype=np.int64),
+        "meeting_heatmap": meeting_heatmap,
+        "transmission_heatmap": transmission_heatmap,
+    }
+    return point, series
+
+
+def information_spread_validation(T: int, seed: int) -> Dict[str, object]:
+    values = [-10.0, 0.0, 10.0]
+    points: List[InformationSpreadPoint] = []
+    series: Dict[str, Dict[str, np.ndarray]] = {}
+    for idx, value in enumerate(values):
+        point, value_series = run_information_spread_case(T=T, lambda_I_value=value, seed=seed + 100 + idx)
+        points.append(point)
+        series[f"{value:+.1f}"] = value_series
+
+    negative = next(point for point in points if point.lambda_I_value < 0.0)
+    zero = next(point for point in points if abs(point.lambda_I_value) < 1e-12)
+    positive = next(point for point in points if point.lambda_I_value > 0.0)
+
+    def finite_or_large(value: int | None) -> float:
+        return float(value) if value is not None else float("inf")
+
+    return {
+        "points": points,
+        "series": series,
+        "negative_reaches_90_percent": bool(negative.time_to_90_percent is not None),
+        "all_cases_reach_90_percent": bool(all(point.time_to_90_percent is not None for point in points)),
+        "all_cases_reach_all_informed": bool(all(point.time_to_all_informed is not None for point in points)),
+        "negative_generates_transmissions": bool(negative.total_transmission_events > 0),
+        "transmission_locations_recorded": bool(negative.transmission_cells_visited > 0),
+        "negative_generates_more_meetings_than_zero_and_positive": bool(
+            negative.total_meetings > zero.total_meetings and negative.total_meetings > positive.total_meetings
+        ),
+        "negative_transmissions_are_more_spatially_concentrated": bool(
+            negative.transmission_cells_visited < zero.transmission_cells_visited
+            and negative.transmission_cells_visited < positive.transmission_cells_visited
+        ),
+        "fastest_fraction_informed_lambda_I": float(
+            min(points, key=lambda point: finite_or_large(point.time_to_90_percent)).lambda_I_value
+        ),
+    }
+
+
 def make_sign_sweep_figure(outdir: Path, sweep: Dict[str, object]) -> None:
     points: List[SignSweepPoint] = sweep["points"]
     values = np.array([point.lambda_I_value for point in points], dtype=np.float64)
@@ -394,8 +604,137 @@ def make_sign_sweep_figure(outdir: Path, sweep: Dict[str, object]) -> None:
     plt.close(fig)
 
 
-def save_raw_data(outdir: Path, sweep: Dict[str, object]) -> None:
+def make_information_spread_figure(outdir: Path, spread: Dict[str, object]) -> None:
+    points: List[InformationSpreadPoint] = spread["points"]
+    series: Dict[str, Dict[str, np.ndarray]] = spread["series"]
+
+    fig, axes = plt.subplots(2, 2, figsize=(12.0, 8.5))
+    colors = {-10.0: "crimson", 0.0: "grey", 10.0: "seagreen"}
+
+    for point in points:
+        key = f"{point.lambda_I_value:+.1f}"
+        axes[0, 0].plot(
+            series[key]["t_axis"],
+            series[key]["informed_fraction"],
+            lw=2.0,
+            color=colors[point.lambda_I_value],
+            label=f"lambda_I={point.lambda_I_value:+.0f}",
+        )
+    axes[0, 0].set_title("Fraction of informed robots")
+    axes[0, 0].set_xlabel("simulation step")
+    axes[0, 0].set_ylabel("informed fraction")
+    axes[0, 0].set_ylim(-0.02, 1.02)
+    axes[0, 0].legend(fontsize=8)
+
+    for point in points:
+        key = f"{point.lambda_I_value:+.1f}"
+        axes[0, 1].plot(
+            series[key]["t_axis"],
+            np.maximum(series[key]["cumulative_meetings"], 1),
+            lw=2.0,
+            color=colors[point.lambda_I_value],
+            label=f"lambda_I={point.lambda_I_value:+.0f}",
+        )
+    axes[0, 1].set_title("Cumulative physical meetings")
+    axes[0, 1].set_xlabel("simulation step")
+    axes[0, 1].set_ylabel("meetings, log scale")
+    axes[0, 1].set_yscale("log")
+    axes[0, 1].legend(fontsize=8)
+
+    labels = [f"{point.lambda_I_value:+.0f}" for point in points]
+    t90 = [
+        point.time_to_90_percent if point.time_to_90_percent is not None else np.nan
+        for point in points
+    ]
+    axes[1, 0].bar(labels, t90, color=[colors[point.lambda_I_value] for point in points])
+    axes[1, 0].set_title("Time to 90% informed")
+    axes[1, 0].set_xlabel("lambda_I")
+    axes[1, 0].set_ylabel("simulation step")
+
+    x = np.arange(len(points))
+    width = 0.35
+    meeting_cells = [point.meeting_cells_visited for point in points]
+    transmission_cells = [point.transmission_cells_visited for point in points]
+    axes[1, 1].bar(x - width / 2, meeting_cells, width=width, color="steelblue", label="meeting cells")
+    axes[1, 1].bar(x + width / 2, transmission_cells, width=width, color="darkorange", label="transmission cells")
+    axes[1, 1].set_xticks(x, labels=labels)
+    axes[1, 1].set_title("Spatial spread of contacts")
+    axes[1, 1].set_xlabel("lambda_I")
+    axes[1, 1].set_ylabel("number of cells")
+    axes[1, 1].legend(fontsize=8)
+
+    fig.suptitle("Information diffusion validation: informed fraction and meeting locations")
+    fig.tight_layout()
+    fig.savefig(outdir / "maxcal_info_diffusion_validation_spread.png", dpi=140)
+    plt.close(fig)
+
+
+def make_information_meeting_maps_figure(outdir: Path, spread: Dict[str, object]) -> None:
+    points: List[InformationSpreadPoint] = spread["points"]
+    series: Dict[str, Dict[str, np.ndarray]] = spread["series"]
+
+    fig, axes = plt.subplots(2, len(points), figsize=(13.8, 7.4))
+    meeting_max = max(
+        float(np.log1p(series[f"{point.lambda_I_value:+.1f}"]["meeting_heatmap"]).max())
+        for point in points
+    )
+    transmission_max = max(
+        float(np.log1p(series[f"{point.lambda_I_value:+.1f}"]["transmission_heatmap"]).max())
+        for point in points
+    )
+    meeting_max = max(meeting_max, 1e-12)
+    transmission_max = max(transmission_max, 1e-12)
+
+    for col, point in enumerate(points):
+        key = f"{point.lambda_I_value:+.1f}"
+        meeting_map = np.log1p(series[key]["meeting_heatmap"]).reshape(mid.NY, mid.NX)
+        transmission_map = np.log1p(series[key]["transmission_heatmap"]).reshape(mid.NY, mid.NX)
+
+        im0 = axes[0, col].imshow(meeting_map, origin="lower", cmap="Blues", vmin=0.0, vmax=meeting_max)
+        axes[0, col].set_title(
+            f"lambda_I={point.lambda_I_value:+.0f}: all meetings\n"
+            f"{point.total_meetings} meetings, {point.meeting_cells_visited} cells"
+        )
+        axes[0, col].set_xlabel("col")
+        axes[0, col].set_ylabel("row")
+        fig.colorbar(im0, ax=axes[0, col], fraction=0.046)
+
+        im1 = axes[1, col].imshow(
+            transmission_map,
+            origin="lower",
+            cmap="magma",
+            vmin=0.0,
+            vmax=transmission_max,
+        )
+        axes[1, col].set_title(
+            f"lambda_I={point.lambda_I_value:+.0f}: successful transmissions\n"
+            f"{point.total_transmission_events} events, {point.transmission_cells_visited} cells"
+        )
+        axes[1, col].set_xlabel("col")
+        axes[1, col].set_ylabel("row")
+        fig.colorbar(im1, ax=axes[1, col], fraction=0.046)
+
+    fig.suptitle("Where robots met and where information changed hands, log(1 + count)")
+    fig.tight_layout()
+    fig.savefig(outdir / "maxcal_info_diffusion_validation_meeting_maps.png", dpi=140)
+    plt.close(fig)
+
+
+def save_raw_data(outdir: Path, sweep: Dict[str, object], spread: Dict[str, object]) -> None:
     points: List[SignSweepPoint] = sweep["points"]
+    spread_points: List[InformationSpreadPoint] = spread["points"]
+    spread_series: Dict[str, Dict[str, np.ndarray]] = spread["series"]
+    spread_arrays: Dict[str, np.ndarray] = {}
+    for point in spread_points:
+        key = f"{point.lambda_I_value:+.1f}".replace("+", "pos_").replace("-", "neg_").replace(".", "_")
+        spread_arrays[f"spread_{key}_t_axis"] = spread_series[f"{point.lambda_I_value:+.1f}"]["t_axis"]
+        spread_arrays[f"spread_{key}_informed_fraction"] = spread_series[f"{point.lambda_I_value:+.1f}"]["informed_fraction"]
+        spread_arrays[f"spread_{key}_cumulative_meetings"] = spread_series[f"{point.lambda_I_value:+.1f}"]["cumulative_meetings"]
+        spread_arrays[f"spread_{key}_cumulative_transmissions"] = spread_series[f"{point.lambda_I_value:+.1f}"]["cumulative_transmissions"]
+        spread_arrays[f"spread_{key}_meetings_per_interval"] = spread_series[f"{point.lambda_I_value:+.1f}"]["meetings_per_interval"]
+        spread_arrays[f"spread_{key}_transmissions_per_interval"] = spread_series[f"{point.lambda_I_value:+.1f}"]["transmissions_per_interval"]
+        spread_arrays[f"spread_{key}_meeting_heatmap"] = spread_series[f"{point.lambda_I_value:+.1f}"]["meeting_heatmap"]
+        spread_arrays[f"spread_{key}_transmission_heatmap"] = spread_series[f"{point.lambda_I_value:+.1f}"]["transmission_heatmap"]
     np.savez(
         outdir / "maxcal_info_diffusion_validation_raw_data.npz",
         lambda_I_values=np.array([point.lambda_I_value for point in points], dtype=np.float64),
@@ -406,6 +745,29 @@ def save_raw_data(outdir: Path, sweep: Dict[str, object]) -> None:
         corner_visit_probability=np.array([point.corner_visit_probability for point in points], dtype=np.float64),
         edge_visit_probability=np.array([point.edge_visit_probability for point in points], dtype=np.float64),
         interior_visit_probability=np.array([point.interior_visit_probability for point in points], dtype=np.float64),
+        spread_lambda_I_values=np.array([point.lambda_I_value for point in spread_points], dtype=np.float64),
+        spread_final_informed_fraction=np.array([point.final_informed_fraction for point in spread_points], dtype=np.float64),
+        spread_time_to_50_percent=np.array([
+            -1 if point.time_to_50_percent is None else point.time_to_50_percent for point in spread_points
+        ], dtype=np.int64),
+        spread_time_to_90_percent=np.array([
+            -1 if point.time_to_90_percent is None else point.time_to_90_percent for point in spread_points
+        ], dtype=np.int64),
+        spread_time_to_all_informed=np.array([
+            -1 if point.time_to_all_informed is None else point.time_to_all_informed for point in spread_points
+        ], dtype=np.int64),
+        spread_total_meetings=np.array([point.total_meetings for point in spread_points], dtype=np.int64),
+        spread_meeting_cells_visited=np.array([point.meeting_cells_visited for point in spread_points], dtype=np.int64),
+        spread_total_transmission_events=np.array([point.total_transmission_events for point in spread_points], dtype=np.int64),
+        spread_transmission_cells_visited=np.array(
+            [point.transmission_cells_visited for point in spread_points],
+            dtype=np.int64,
+        ),
+        spread_transmission_efficiency=np.array(
+            [point.transmission_efficiency for point in spread_points],
+            dtype=np.float64,
+        ),
+        **spread_arrays,
     )
 
 
@@ -418,9 +780,11 @@ def save_summary(
     meeting: Dict[str, int | bool],
     sweep: Dict[str, object],
     preview: Dict[str, object],
+    spread: Dict[str, object],
 ) -> None:
     points: List[SignSweepPoint] = sweep["points"]
     zero_point: SignSweepPoint = sweep["zero_baseline"]
+    spread_points: List[InformationSpreadPoint] = spread["points"]
 
     summary = {
         "config": {
@@ -432,6 +796,7 @@ def save_summary(
             "lambda_I_sign_sweep": SIGN_SWEEP_VALUES,
             "sign_sweep_T": args.sign_sweep_T,
             "stage2_preview_T": args.stage2_preview_T,
+            "spread_T": args.spread_T,
             "seed": args.seed,
             "pure_stale_age": PURE_STALE_AGE,
         },
@@ -450,6 +815,28 @@ def save_summary(
             "zero_baseline_preserves_degree_ordering": sweep["zero_baseline_preserves_degree_ordering"],
         },
         "stage2_preview": preview,
+        "informed_robot_spread": {
+            "points": [asdict(point) for point in spread_points],
+            "negative_reaches_90_percent": spread["negative_reaches_90_percent"],
+            "all_cases_reach_90_percent": spread["all_cases_reach_90_percent"],
+            "all_cases_reach_all_informed": spread["all_cases_reach_all_informed"],
+            "negative_generates_transmissions": spread["negative_generates_transmissions"],
+            "transmission_locations_recorded": spread["transmission_locations_recorded"],
+            "negative_generates_more_meetings_than_zero_and_positive": spread[
+                "negative_generates_more_meetings_than_zero_and_positive"
+            ],
+            "negative_transmissions_are_more_spatially_concentrated": spread[
+                "negative_transmissions_are_more_spatially_concentrated"
+            ],
+            "fastest_fraction_informed_lambda_I": spread["fastest_fraction_informed_lambda_I"],
+            "interpretation": (
+                "Fraction-informed curves and transmission heatmaps validate information diffusion "
+                "more directly than visit maps by measuring robot-level information spread, the number "
+                "of physical meetings that make communication possible, and where information-changing "
+                "encounters occurred. Cumulative successful transmissions are not used as a primary plot "
+                "because they are almost algebraically equivalent to the number of newly informed robots."
+            ),
+        },
     }
 
     summary["layer1_i_ready_for_stage2"] = bool(
@@ -475,6 +862,13 @@ def save_summary(
         and preview["fresh_information_recovers_coverage_baseline"]
         and preview["stale_information_activates_clustering"]
         and preview["closed_loop_generates_meetings"]
+        and spread["negative_reaches_90_percent"]
+        and spread["all_cases_reach_90_percent"]
+        and spread["all_cases_reach_all_informed"]
+        and spread["negative_generates_transmissions"]
+        and spread["transmission_locations_recorded"]
+        and spread["negative_generates_more_meetings_than_zero_and_positive"]
+        and spread["negative_transmissions_are_more_spatially_concentrated"]
     )
 
     with open(outdir / "maxcal_info_diffusion_validation_summary.json", "w", encoding="utf-8") as handle:
@@ -492,10 +886,13 @@ def main() -> None:
     meeting = meeting_reset_checks()
     sweep = sign_sweep(T=args.sign_sweep_T, seed=args.seed)
     preview = stage2_preview(T=args.stage2_preview_T, seed=args.seed)
+    spread = information_spread_validation(T=args.spread_T, seed=args.seed)
 
     make_sign_sweep_figure(outdir, sweep)
-    save_raw_data(outdir, sweep)
-    save_summary(outdir, args, kernel, field, gate, meeting, sweep, preview)
+    make_information_spread_figure(outdir, spread)
+    make_information_meeting_maps_figure(outdir, spread)
+    save_raw_data(outdir, sweep, spread)
+    save_summary(outdir, args, kernel, field, gate, meeting, sweep, preview, spread)
 
     ready = (
         kernel["zero_lambda_recovers_uniform_kernel"]
@@ -510,7 +907,15 @@ def main() -> None:
         and preview["fresh_information_recovers_coverage_baseline"]
         and preview["stale_information_activates_clustering"]
         and preview["closed_loop_generates_meetings"]
+        and spread["negative_reaches_90_percent"]
+        and spread["all_cases_reach_90_percent"]
+        and spread["all_cases_reach_all_informed"]
+        and spread["negative_generates_transmissions"]
+        and spread["transmission_locations_recorded"]
+        and spread["negative_generates_more_meetings_than_zero_and_positive"]
+        and spread["negative_transmissions_are_more_spatially_concentrated"]
     )
+    negative_spread = next(point for point in spread["points"] if point.lambda_I_value < 0.0)
 
     print("MaxCal Information Diffusion Validation (Layer 1-I)")
     print(f"  Output directory      : {outdir}")
@@ -526,6 +931,13 @@ def main() -> None:
         f"fresh->coverage={preview['fresh_information_recovers_coverage_baseline']}, "
         f"stale->cluster={preview['stale_information_activates_clustering']}, "
         f"meetings={preview['closed_loop_generates_meetings']}"
+    )
+    print(
+        "  Informed spread       : "
+        f"lambda_I=-10 reaches 90% at t={negative_spread.time_to_90_percent}, "
+        f"meetings={negative_spread.total_meetings}, "
+        f"transmission cells={negative_spread.transmission_cells_visited}, "
+        f"fastest lambda_I={spread['fastest_fraction_informed_lambda_I']:+.0f}"
     )
     print("  Saved summary         : maxcal_info_diffusion_validation_summary.json")
 

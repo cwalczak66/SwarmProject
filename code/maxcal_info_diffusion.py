@@ -72,7 +72,7 @@ LAMBDA_C_VAL = 0.0
 # Pinciroli sign convention:
 #   lambda_I < 0  -> cluster
 #   lambda_I >= 0 -> coverage / anti-cluster
-LAMBDA_I_VAL = 10.0        # Testing with negative and positive 10 give the opposite behaviors.
+LAMBDA_I_VAL = -10.0        # Testing with negative and positive 10 give the opposite behaviors.
 
 # Gate parameters.
 A_HALF = 1.0  # Half-age for the information gate g(A_I) = A_I / (A_I + A_half). This controls how quickly
