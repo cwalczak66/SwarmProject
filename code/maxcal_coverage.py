@@ -11,15 +11,18 @@ RUN:
 from __future__ import annotations
 
 import math
+import os
+import tempfile
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import List, Tuple
+
+os.environ.setdefault("MPLCONFIGDIR", str(Path(tempfile.gettempdir()) / "mplconfig"))
+os.environ.setdefault("XDG_CACHE_HOME", tempfile.gettempdir())
 
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib import animation
-
-import argparse
-import os
 
 
 # ============================================================
@@ -59,8 +62,8 @@ class World:
 
 
 def build_world(Nx: int, Ny: int, cell_size: float) -> World:
-    K = Nx * Ny     # grid size K, each cell is a state k in the the Markov Model
-    adj: List[List[int]] = [[] for _ in range(K)]   # make a list that for each cell holds a list of integers (all the connected neighbors)
+    K = Nx * Ny
+    adj: List[List[int]] = [[] for _ in range(K)]
 
     for k in range(K):
         row, col = divmod(k, Nx)
@@ -414,35 +417,11 @@ def make_animation(res: SimResult, fps: int = 12, filename: str = "maxcal_covera
 
 
 # ============================================================
-# 7. PARSING ARGUMENTS
-# ============================================================
-
-def parse_args():
-    parser = argparse.ArgumentParser(description="MaxCal Coverage Simulation")
-    parser.add_argument(
-        "--outdir",
-        type=str,
-        default=os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            "Figures"
-        ),
-        help="Directory to save output figures (default: Figures)"
-    )
-    return parser.parse_args()
-
-# ============================================================
-# 8. ENTRY POINT
+# 7. ENTRY POINT
 # ============================================================
 
 def main():
-    args = parse_args()
-    outdir = args.outdir
-
-    # Create directory if it doesn't exist
-    os.makedirs(outdir, exist_ok=True)
-
     print("MaxCal Coverage Simulation")
-    print(f"  Output  : {outdir}/")
     print(f"  World   : {NX}x{NY} grid, cell={CELL_SIZE} m")
     print(f"  Swarm   : {N_ROBOTS} robots, speed={ROBOT_SPEED} m/step")
     print(f"  Duration: {T_SIM} steps")
@@ -454,24 +433,25 @@ def main():
     print(f"  Expected per robot: ~{round(result.markov_step_history[-1] / N_ROBOTS)}")
     print()
 
-    # ---- Save outputs into directory ----
-    main_path = os.path.join(outdir, "maxcal_coverage_main.png")
-    gif_path = os.path.join(outdir, "maxcal_coverage.gif")
-    phase_path = os.path.join(outdir, "maxcal_coverage_phase.png")
-
-    print(f"Saving main figure → {main_path}")
+    print("Saving main figure → maxcal_coverage_main.png")
     fig_main = make_main_figure(result)
-    fig_main.savefig(main_path, dpi=120)
+    fig_main.savefig("maxcal_coverage_main.png", dpi=120)
     plt.close(fig_main)
 
-    print(f"Saving animation → {gif_path}")
-    make_animation(result, filename=gif_path)
+    print("Saving animation → maxcal_coverage.gif")
+    make_animation(result)
 
     print("Saving phase diagram (runs 5 additional simulations)...")
     fig_phase = make_phase_figure()
-    fig_phase.savefig(phase_path, dpi=120)
+    fig_phase.savefig("maxcal_coverage_phase.png", dpi=120)
     plt.close(fig_phase)
-    print(f"  Saved {phase_path}")
+    print("  Saved maxcal_coverage_phase.png")
+
+    print()
+    print("Done. Open the .png files to inspect results.")
+    print("Expected: empirical π̂_k closely tracks theoretical π̄_k ∝ deg(k).")
+    print("          Interior cells visited ~8/5 ≈ 1.6× more than edge cells.")
+    print("          Corner cells visited ~3/8 ≈ 0.375× as often as interior.")
 
 
 if __name__ == "__main__":
