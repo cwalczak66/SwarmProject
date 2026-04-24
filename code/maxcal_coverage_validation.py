@@ -1,11 +1,9 @@
 """
-Standalone validation harness for Coverage Layer 1-C.
+Standalone validation script for Coverage Layer 1-C.
 
-This script keeps the controller in ``maxcal_coverage.py`` unchanged and
-computes the checks described in the methodology:
-
+This script uses the controller in ``maxcal_coverage.py`` to run a single baseline simulation and a speed sweep, and performs the following checks and analyses:
 - the lambda_C = 0 kernel is row-stochastic and uniform over neighbors
-- the stationary target is pi_bar_k proportional to deg(k)
+- the stationary target is π̄_k proportional to deg(k)
 - the discrete Markov update only fires on arrival
 - capped motion prevents overshoot
 - the L1 coverage error is measured in Markov time
@@ -144,15 +142,27 @@ def motion_and_arrival_checks(world: mc.World, transition: np.ndarray) -> Dict[s
     in_transit = mc.Robot(0, x0, y0, from_k, to_k, tx, ty)
     visits_transit = np.zeros(world.K, dtype=np.int64)
     slow_speed = dist / 3.0
-    mc.step_robot(in_transit, world, transition, slow_speed, visits_transit, rng)
+    mc.step_robot(in_transit, world, transition, slow_speed, visits_transit, rng, t=1)
     transit_move = float(np.hypot(in_transit.x - x0, in_transit.y - y0))
     transit_remaining = float(np.hypot(tx - in_transit.x, ty - in_transit.y))
 
     arrival = mc.Robot(1, x0, y0, from_k, to_k, tx, ty)
     visits_arrival = np.zeros(world.K, dtype=np.int64)
+    global_last_visit_time = np.full(world.K, -1.0, dtype=np.float64)
+    global_last_visit_time[from_k] = 0.0
     fast_speed = dist * 10.0
-    mc.step_robot(arrival, world, transition, fast_speed, visits_arrival, rng)
+    mc.step_robot(
+        arrival,
+        world,
+        transition,
+        fast_speed,
+        visits_arrival,
+        rng,
+        t=5,
+        global_last_visit_time=global_last_visit_time,
+    )
     arrival_move = float(np.hypot(arrival.x - x0, arrival.y - y0))
+    arrival_map = mc.ensure_robot_map(arrival, world)
 
     return {
         "transit_from_k_unchanged": in_transit.from_k == from_k,
@@ -165,6 +175,11 @@ def motion_and_arrival_checks(world: mc.World, transition: np.ndarray) -> Dict[s
         "arrival_position_exact": abs(arrival.x - tx) < 1e-12 and abs(arrival.y - ty) < 1e-12,
         "arrival_move_capped_to_distance": abs(arrival_move - dist) < 1e-12,
         "arrival_next_target_is_neighbor": arrival.to_k in world.adjacency[arrival.from_k],
+        "arrival_local_coverage_timestamp_recorded": bool(arrival_map.last_visit_time[to_k] == 5.0),
+        "arrival_local_map_record_timestamp_recorded": bool(arrival_map.last_map_record_time[to_k] == 5.0),
+        "arrival_global_coverage_timestamp_recorded": bool(global_last_visit_time[to_k] == 5.0),
+        "arrival_local_coverage_age_zero": bool(arrival_map.coverage_age(5.0)[to_k] == 0.0),
+        "arrival_local_map_record_age_zero": bool(arrival_map.map_record_age(5.0)[to_k] == 0.0),
         "target_distance": dist,
     }
 
@@ -288,6 +303,10 @@ def save_raw_data(outdir: Path, baseline: Dict[str, object], speed_sweep: Dict[s
         baseline_l1_errors=baseline["l1_errors"],
         baseline_ck_history=baseline["ck_history"],
         baseline_pi_theory=baseline["pi_theory"],
+        baseline_t_axis=baseline["result"].t_axis,
+        baseline_mean_global_coverage_age=baseline["result"].mean_global_coverage_age,
+        baseline_mean_local_coverage_age=baseline["result"].mean_local_coverage_age,
+        baseline_mean_local_map_record_age=baseline["result"].mean_local_map_record_age,
         speed_sweep_speeds=np.array([run["speed"] for run in speed_sweep["runs"]], dtype=np.float64),
         speed_sweep_final_markov_steps=np.array(
             [run["final_markov_steps"] for run in speed_sweep["runs"]],
@@ -324,7 +343,7 @@ def make_baseline_figure(outdir: Path, baseline: Dict[str, object]) -> None:
     )
     axes[0].set_title(f"Baseline L1 convergence, R^2={fit.r2:.3f}")
     axes[0].set_xlabel("Markov steps (arrivals)")
-    axes[0].set_ylabel("||c(.,t) - pi_bar(.)||_1")
+    axes[0].set_ylabel("||c(.,t) - π̄(.)||_1")
     axes[0].legend(loc="upper right")
 
     colors = {"corner": "red", "edge": "darkorange", "interior": "seagreen"}
@@ -352,12 +371,57 @@ def make_baseline_figure(outdir: Path, baseline: Dict[str, object]) -> None:
         origin="lower",
         cmap="Reds",
     )
-    ax.set_title("Final |pi_hat_k - pi_bar_k|")
+    ax.set_title("Final |π̂_k - π̄_k|")
     ax.set_xlabel("col")
     ax.set_ylabel("row")
     fig.tight_layout()
     fig.savefig(outdir / "maxcal_coverage_validation_final_error_map.png", dpi=140)
     plt.close(fig)
+
+    if (
+        result.t_axis is not None
+        and result.mean_global_coverage_age is not None
+        and result.mean_local_coverage_age is not None
+        and result.mean_local_map_record_age is not None
+    ):
+        fig, axes = plt.subplots(1, 2, figsize=(12.0, 4.8))
+
+        axes[0].plot(
+            result.t_axis,
+            result.mean_global_coverage_age,
+            lw=2.0,
+            color="seagreen",
+        )
+        axes[0].set_title("Paper coverage age")
+        axes[0].set_xlabel("simulation step")
+        axes[0].set_ylabel("mean age over cells (steps)")
+        axes[0].grid(alpha=0.25)
+
+        axes[1].plot(
+            result.t_axis,
+            result.mean_local_coverage_age,
+            lw=1.8,
+            color="navy",
+            label="mean local coverage age",
+        )
+        axes[1].plot(
+            result.t_axis,
+            result.mean_local_map_record_age,
+            lw=1.5,
+            color="crimson",
+            ls="--",
+            label="mean local map-record age",
+        )
+        axes[1].set_title("Local robot-map diagnostic")
+        axes[1].set_xlabel("simulation step")
+        axes[1].set_ylabel("mean age over robot maps (steps)")
+        axes[1].grid(alpha=0.25)
+        axes[1].legend(loc="upper left")
+
+        fig.suptitle("Coverage-age observables: global paper metric vs local maps")
+        fig.tight_layout()
+        fig.savefig(outdir / "maxcal_coverage_validation_age_observables.png", dpi=140)
+        plt.close(fig)
 
 
 def make_speed_figure(outdir: Path, speed_sweep: Dict[str, object]) -> None:
@@ -371,13 +435,13 @@ def make_speed_figure(outdir: Path, speed_sweep: Dict[str, object]) -> None:
     axes[0].set_yscale("log")
     axes[0].set_title("L1 error in Markov time")
     axes[0].set_xlabel("Markov steps (arrivals)")
-    axes[0].set_ylabel("||c(.,t) - pi_bar(.)||_1")
+    axes[0].set_ylabel("||c(.,t) - π̄(.)||_1")
     axes[0].legend(loc="upper right")
 
     axes[1].set_yscale("log")
     axes[1].set_title("L1 error in simulation time")
     axes[1].set_xlabel("Simulation steps")
-    axes[1].set_ylabel("||c(.,t) - pi_bar(.)||_1")
+    axes[1].set_ylabel("||c(.,t) - π̄(.)||_1")
     axes[1].legend(loc="upper right")
 
     fig.tight_layout()
@@ -414,6 +478,15 @@ def save_summary(
         "baseline_run": {
             "total_markov_steps": int(baseline["markov_steps"][-1]),
             "final_l1_error": float(baseline["l1_errors"][-1]),
+            "final_mean_global_coverage_age": float(
+                baseline["result"].mean_global_coverage_age[-1]
+            ) if baseline["result"].mean_global_coverage_age is not None else None,
+            "final_mean_local_coverage_age": float(
+                baseline["result"].mean_local_coverage_age[-1]
+            ) if baseline["result"].mean_local_coverage_age is not None else None,
+            "final_mean_local_map_record_age": float(
+                baseline["result"].mean_local_map_record_age[-1]
+            ) if baseline["result"].mean_local_map_record_age is not None else None,
             "fit": asdict(fit),
             "fit_pass_r2_gt_0_95": bool(fit.r2 > 0.95),
             "representative_cells": {label: asdict(rep) for label, rep in reps.items()},
@@ -447,6 +520,11 @@ def save_summary(
         and motion["arrival_from_k_updated"]
         and motion["arrival_position_exact"]
         and motion["arrival_move_capped_to_distance"]
+        and motion["arrival_local_coverage_timestamp_recorded"]
+        and motion["arrival_local_map_record_timestamp_recorded"]
+        and motion["arrival_global_coverage_timestamp_recorded"]
+        and motion["arrival_local_coverage_age_zero"]
+        and motion["arrival_local_map_record_age_zero"]
         and summary["baseline_run"]["fit_pass_r2_gt_0_95"]
         and summary["speed_sweep"]["markov_time_collapse_stronger_than_simulation_time"]
     )

@@ -1,6 +1,35 @@
 """
 maxcal_coverage.py
 
+Coverage Layer 1-C validation controller.
+
+This module implements coverage-only controller on the 20 x 20 region graph used throughout the project.
+The paper-level MaxCal kernel is the destination-weighted transition rule
+
+    P_ij = w_ij exp(-lambda_C^j) / Z_i,
+    Z_i = sum_{l in N(i)} w_il exp(-lambda_C^l),
+
+with unit edge weights w_ij = 1 on the undirected 8-connected grid. For equal coverage multipliers, 
+and in particular for the baseline choice lambda_C^l = 0 for all l, the kernel reduces to the uniform 
+random walk over neighbors. By detailed balance the stationary distribution then satisfies
+
+    π_i proportional to deg(i)
+    
+where deg(i) is the degree of cell i in the region graph (the number of neighboring cells). 
+This is the forward Layer 1-C prediction validated in ``maxcal_coverage_validation.py``.
+
+The same reversible form also supports the inverse coverage problem, where we are trying to compute the optimal multipliers given a target stationary distribution.  
+Writing b_i = exp(-lambda_C^i), the stationary distribution of the kernel is
+
+    π_i(b) proportional to b_i (A b)_i, where (A b)_i = sum_j A_ij b_j is the neighbor-weighted sum at i,
+
+where A is the adjacency matrix.  The inverse solver uses this relation to recover lambda_C from a prescribed stationary target.  
+This is the offline "god-knowledge" design step; the robots themselves still execute only the local transition rule by looking up neighbor multipliers.
+
+Each robot also carries a local cell-wise map storing the most recent known visit time for every cell. 
+That map is not part of the Layer 1-C transition kernel itself. It is recorded here so the same controller exposes the
+coverage-age observable needed later by the hierarchical architecture.
+
 SETUP:
     pip install numpy matplotlib pillow
 
@@ -13,7 +42,7 @@ from __future__ import annotations
 import math
 import os
 import tempfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Tuple
 
@@ -23,6 +52,12 @@ os.environ.setdefault("XDG_CACHE_HOME", tempfile.gettempdir())
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib import animation
+
+from maxcal_local_maps import (
+    RobotWorldMap,
+    mean_robot_coverage_age,
+    mean_robot_map_record_age,
+)
 
 
 # ============================================================
@@ -39,13 +74,15 @@ RECORD_EVERY = 60        # steps between c_k(t) snapshots
 SNAP_EVERY = 300         # steps between position snapshots
 LAMBDA_C_VAL = 0.0       # symmetric multiplier (see §1 note)
 SEED = 42
+INVERSE_SOLVER_TOL = 1.0e-12
+INVERSE_SOLVER_MAX_ITERS = 100_000
 
 # NOTE on LAMBDA_C_VAL = 0:
 #   Theory Eq.(1): p*(k2|k1) = w_{k2,k1}·exp(−λ_C^{k2}) / Z(k1)
 #   With equal multipliers ∀k, exp(−λ_C) cancels in the ratio,
 #   giving a uniform random walk: p*(k2|k1) = 1 / |N(k1)|.
-#   The stationary distribution is then π_k ∝ deg(k) (see §3).
-#   We keep the full formula so non-uniform λ_C^k slots in later.
+#   The stationary distribution is then π_k ∝ deg(k).
+#   The full formula is kept so non-uniform λ_C^k can be computed.
 
 
 # ============================================================
@@ -62,6 +99,7 @@ class World:
 
 
 def build_world(Nx: int, Ny: int, cell_size: float) -> World:
+    """Build the undirected region graph used."""
     K = Nx * Ny
     adj: List[List[int]] = [[] for _ in range(K)]
 
@@ -80,6 +118,7 @@ def build_world(Nx: int, Ny: int, cell_size: float) -> World:
 
 
 def region_center(w: World, k: int) -> Tuple[float, float]:
+    """Return the continuous-space centre of region ``k``."""
     row, col = divmod(k, w.Nx)
     x = (col + 0.5) * w.cell_size
     y = (row + 0.5) * w.cell_size
@@ -92,14 +131,23 @@ def region_center(w: World, k: int) -> Tuple[float, float]:
 #
 # Theory, Eq.(1):
 #   p*(k2 | k1) = w_{k2,k1} · exp(−λ_C^{k2}) / Z(k1)
-#   Z(k1)       = Σ_{k2 ∈ N(k1)} w_{k2,k1} · exp(−λ_C^{k2})
+#   Z(k1) = Σ_{k2 ∈ N(k1)} w_{k2,k1} · exp(−λ_C^{k2})
 #
 # Here w = 1 for all edges (isotropic cost, absorbed into adjacency).
-# We pre-compute the full K×K matrix so the inner loop is a table look-up.
-# Later: replace or augment lambda_C to add λ_E (energy) or λ_I (info).
-
+# We pre-compute the full K×K transition matrix so the inner loop is a table look-up.
 
 def build_transition_matrix(w: World, lambda_C: np.ndarray) -> np.ndarray:
+    """
+    Assemble the transition matrix for the MaxCal kernel from Eq. (1).
+
+        P_ij = A_ij exp(-lambda_C^j) / sum_{l in N(i)} A_il exp(-lambda_C^l).
+
+    Because the graph is unweighted and undirected in this implementation,
+    ``A_ij`` is simply the adjacency indicator on the 8-connected grid.
+    """
+    lambda_C = np.asarray(lambda_C, dtype=np.float64)
+    if lambda_C.shape != (w.K,):
+        raise ValueError(f"lambda_C must have shape ({w.K},), got {lambda_C.shape}.")
     P = np.zeros((w.K, w.K), dtype=np.float64)
     for k1 in range(w.K):
         neighbors = w.adjacency[k1]
@@ -111,6 +159,7 @@ def build_transition_matrix(w: World, lambda_C: np.ndarray) -> np.ndarray:
 
 
 def sample_next_region(w: World, k: int, P: np.ndarray, rng: np.random.Generator) -> int:
+    """Sample one Markov transition from the precomputed transition matrix."""
     nb = w.adjacency[k]
     probs = P[k, nb]
     r = rng.random()
@@ -120,6 +169,255 @@ def sample_next_region(w: World, k: int, P: np.ndarray, rng: np.random.Generator
         if s >= r:
             return nb[i]
     return nb[-1]   # fallback for floating-point edge case
+
+
+@dataclass
+class InverseCoverageSolution:
+    """
+    Result of the inverse Layer 1-C design solve.
+
+    ``lambda_C`` is the multiplier field recovered from the target stationary
+    distribution, while the remaining fields document numerical accuracy of the
+    solver used to achieve the inverse relation.
+    """
+    lambda_C: np.ndarray
+    stationary: np.ndarray
+    iterations: int
+    max_abs_stationary_error: float
+    l1_stationary_error: float
+    converged: bool
+    error_history: np.ndarray
+
+
+@dataclass
+class CoverageController:
+    """
+    Full Layer 1-C coverage controller.
+
+    This keeps together the multiplier field, the precomputed transition
+    matrix, the stationary target that motivated those multipliers, and the
+    optional inverse-solver diagnostics when the controller was obtained by
+    target inversion rather than by a forward baseline choice.
+    """
+    lambda_C: np.ndarray
+    transition: np.ndarray
+    target_pi: np.ndarray
+    target_mode: str # "degree", "uniform", "custom", or "explicit_lambda".
+    # "degree": forward baseline with equal multipliers, stationary distribution proportional to degree.
+    # "uniform": uniform stationary distribution.
+    # "custom": custom stationary distribution.
+    # "explicit_lambda": explicit lambda values.
+
+    # If target_mode is "custom", this field contains the result of solving the inverse MaxCal problem for the specified target_pi. Otherwise, it is None.
+    inverse_solution: InverseCoverageSolution | None = None 
+
+
+def adjacency_matrix(w: World) -> np.ndarray:
+    """Return the binary adjacency matrix A of the region graph."""
+    adjacency = np.zeros((w.K, w.K), dtype=np.float64)
+    for k, neighbors in enumerate(w.adjacency):
+        adjacency[k, neighbors] = 1.0
+    return adjacency
+
+
+def uniform_stationary(w: World) -> np.ndarray:
+    """Uniform target pi_k = 1 / K used by the inverse coverage validation."""
+    return np.full(w.K, 1.0 / w.K, dtype=np.float64)
+
+
+def stationary_from_weights(w: World, b: np.ndarray) -> np.ndarray:
+    """
+    Stationary distribution of the coverage kernel written in b_i = exp(-lambda_i).
+
+    For an undirected unit-weight graph,
+
+        P_ij = A_ij b_j / sum_l A_il b_l
+
+    is reversible with stationary distribution
+
+        π_i ∝ b_i sum_j A_ij b_j.
+
+    This is the key inverse-MaxCal relation used to solve lambda_C from a
+    desired stationary target.
+    """
+    b = np.asarray(b, dtype=np.float64)
+    if b.shape != (w.K,):
+        raise ValueError(f"b must have shape ({w.K},), got {b.shape}.")
+    neighbor_mass = np.array([float(np.sum(b[w.adjacency[k]])) for k in range(w.K)], dtype=np.float64)
+    raw = b * neighbor_mass
+    return raw / raw.sum()
+
+
+def stationary_from_lambda(w: World, lambda_C: np.ndarray) -> np.ndarray:
+    """
+    Evaluate the reversible stationary distribution induced by ``lambda_C``.
+
+    The mean shift is removed first because adding the same constant to every
+    multiplier leaves all transition probabilities unchanged.
+    """
+    lambda_C = np.asarray(lambda_C, dtype=np.float64)
+    shifted = lambda_C - float(np.mean(lambda_C))
+    return stationary_from_weights(w, np.exp(-shifted))
+
+
+def power_stationary_distribution(
+    transition: np.ndarray,
+    tol: float = 1.0e-14,
+    max_iters: int = 200_000,
+) -> np.ndarray:
+    """Generic stationary solver used only as a numerical cross-check."""
+    pi = np.full(transition.shape[0], 1.0 / transition.shape[0], dtype=np.float64)
+    for _ in range(max_iters):
+        nxt = pi @ transition
+        if float(np.max(np.abs(nxt - pi))) < tol:
+            return nxt / nxt.sum()
+        pi = nxt
+    return pi / pi.sum()
+
+
+def solve_coverage_multipliers_for_target(
+    w: World,
+    target_pi: np.ndarray,
+    tol: float = INVERSE_SOLVER_TOL,
+    max_iters: int = INVERSE_SOLVER_MAX_ITERS,
+) -> InverseCoverageSolution:
+    """
+    Solve the inverse coverage MaxCal problem.
+
+    Input:
+        target_pi[k] = desired stationary visit frequency for cell k.
+
+    Output:
+        lambda_C[k] values that make the MaxCal kernel's stationary
+        distribution match target_pi, up to numerical tolerance.
+
+    The gauge is fixed by enforcing mean(lambda_C) = 0, because adding the same
+    constant to every multiplier does not change transition probabilities.
+
+    Numerically, this is solved by symmetric proportional fitting on the
+    appendix relation
+
+        π_i(b) proportional to b_i (A b)_i,   b_i = exp(-lambda_C^i),
+
+    rather than by a single closed-form expression for lambda_C. The iteration
+    updates underrepresented cells upward in ``b_i`` and overrepresented cells
+    downward until the stationary distribution matches the requested target.
+    """
+    target = np.asarray(target_pi, dtype=np.float64)
+    if target.shape != (w.K,):
+        raise ValueError(f"target_pi must have shape ({w.K},), got {target.shape}.")
+    if np.any(target <= 0.0):
+        raise ValueError("The inverse MaxCal solver requires a strictly positive target distribution.")
+    target = target / target.sum()
+
+    b = np.ones(w.K, dtype=np.float64)
+    error_history: List[float] = []
+    converged = False
+    iteration = 0
+
+    for iteration in range(max_iters + 1):
+        stationary = stationary_from_weights(w, b)
+        err = float(np.max(np.abs(stationary - target)))
+        error_history.append(err)
+        if err < tol:
+            converged = True
+            break
+
+        # Symmetric proportional fitting for π_i(b) proportional to b_i (A b)_i.
+        # Underrepresented cells get larger b_i = exp(-lambda_i), therefore
+        # lower lambda_i and higher incoming transition probability.
+        b *= np.sqrt(target / np.maximum(stationary, 1.0e-300))
+        b /= np.exp(float(np.mean(np.log(b))))
+
+    lambda_C = -np.log(b)
+    lambda_C -= float(np.mean(lambda_C))
+    stationary = stationary_from_lambda(w, lambda_C)
+    return InverseCoverageSolution(
+        lambda_C=lambda_C,
+        stationary=stationary,
+        iterations=int(iteration),
+        max_abs_stationary_error=float(np.max(np.abs(stationary - target))),
+        l1_stationary_error=float(np.sum(np.abs(stationary - target))),
+        converged=bool(converged),
+        error_history=np.array(error_history, dtype=np.float64),
+    )
+
+
+def build_coverage_controller(
+    w: World,
+    target_mode: str = "degree",
+    lambda_C_val: float = LAMBDA_C_VAL,
+    target_pi: np.ndarray | None = None,
+    lambda_C: np.ndarray | None = None,
+    tol: float = INVERSE_SOLVER_TOL,
+    max_iters: int = INVERSE_SOLVER_MAX_ITERS,
+) -> CoverageController:
+    """
+    Build the MaxCal coverage controller.
+
+    Modes:
+        degree
+            Forward baseline: equal multipliers, stationary pi proportional to
+            cell degree by detailed balance.
+
+        uniform
+            Inverse-MaxCal controller: target π_k = 1/K and solve lambda_C.
+
+        custom
+            Inverse-MaxCal controller for a user-supplied target_pi.
+
+        explicit_lambda
+            Use a supplied lambda_C directly; target_pi is used only as the
+            reference distribution for diagnostics.
+    """
+    if lambda_C is not None:
+        lambda_arr = np.asarray(lambda_C, dtype=np.float64)
+        if lambda_arr.shape != (w.K,):
+            raise ValueError(f"lambda_C must have shape ({w.K},), got {lambda_arr.shape}.")
+        reference = stationary_from_lambda(w, lambda_arr) if target_pi is None else np.asarray(target_pi, dtype=np.float64)
+        reference = reference / reference.sum()
+        return CoverageController(
+            lambda_C=lambda_arr.copy(),
+            transition=build_transition_matrix(w, lambda_arr),
+            target_pi=reference,
+            target_mode="explicit_lambda" if target_mode == "degree" else target_mode,
+            inverse_solution=None,
+        )
+
+    if target_pi is not None or target_mode == "custom":
+        if target_pi is None:
+            raise ValueError("target_pi is required when target_mode='custom'.")
+        solution = solve_coverage_multipliers_for_target(w, target_pi, tol=tol, max_iters=max_iters)
+        return CoverageController(
+            lambda_C=solution.lambda_C,
+            transition=build_transition_matrix(w, solution.lambda_C),
+            target_pi=np.asarray(target_pi, dtype=np.float64) / np.sum(target_pi),
+            target_mode="custom",
+            inverse_solution=solution,
+        )
+
+    if target_mode == "uniform":
+        target = uniform_stationary(w)
+        solution = solve_coverage_multipliers_for_target(w, target, tol=tol, max_iters=max_iters)
+        return CoverageController(
+            lambda_C=solution.lambda_C,
+            transition=build_transition_matrix(w, solution.lambda_C),
+            target_pi=target,
+            target_mode="uniform",
+            inverse_solution=solution,
+        )
+
+    if target_mode == "degree":
+        lambda_arr = np.full(w.K, lambda_C_val, dtype=np.float64)
+        return CoverageController(
+            lambda_C=lambda_arr,
+            transition=build_transition_matrix(w, lambda_arr),
+            target_pi=stationary_from_lambda(w, lambda_arr),
+            target_mode="degree",
+            inverse_solution=None,
+        )
+
+    raise ValueError("target_mode must be one of: 'degree', 'uniform', 'custom', 'explicit_lambda'.")
 
 
 # ============================================================
@@ -139,8 +437,7 @@ def sample_next_region(w: World, k: int, P: np.ndarray, rng: np.random.Generator
 #   Interior cells (324):          degree 8
 
 def theoretical_stationary(w: World) -> np.ndarray:
-    degrees = np.array([len(w.adjacency[k]) for k in range(w.K)], dtype=np.float64)
-    return degrees / degrees.sum()
+    return stationary_from_lambda(w, np.zeros(w.K, dtype=np.float64))
 
 
 # ============================================================
@@ -169,6 +466,13 @@ def theoretical_stationary(w: World) -> np.ndarray:
 
 @dataclass
 class Robot:
+    """
+    Continuous robot state used to physically realize the discrete Markov chain.
+
+    ``from_k`` is the current Markov state. ``to_k`` is the next sampled region.
+    The continuous coordinates ``(x, y)`` and target centre ``(tx, ty)`` are
+    the motion-layer realization of that discrete state sequence.
+    """
     id: int
     x: float
     y: float
@@ -176,19 +480,43 @@ class Robot:
     to_k: int       # next target region
     tx: float       # target centre x
     ty: float       # target centre y
+    world_map: RobotWorldMap | None = None
+
+
+def ensure_robot_map(r: Robot, w: World, t: float = 0.0) -> RobotWorldMap:
+    """Allocate the robot's local coverage-age map on first use."""
+    if r.world_map is None:
+        r.world_map = RobotWorldMap.empty(w.K)
+        r.world_map.observe_cell(r.from_k, t)
+    return r.world_map
 
 
 def make_robot(idx: int, w: World, P: np.ndarray, rng: np.random.Generator) -> Robot:
+    """Spawn one robot at a random region and sample its first target region."""
     k0 = int(rng.integers(0, w.K))
     cx, cy = region_center(w, k0)
     k1 = sample_next_region(w, k0, P, rng)
     tx, ty = region_center(w, k1)
-    return Robot(idx, cx, cy, k0, k1, tx, ty)
+    world_map = RobotWorldMap.empty(w.K)
+    world_map.observe_cell(k0, 0.0)
+    return Robot(idx, cx, cy, k0, k1, tx, ty, world_map)
 
 
 def step_robot(r: Robot, w: World, P: np.ndarray,
                speed: float, markov_visits: np.ndarray,
-               rng: np.random.Generator) -> None:
+               rng: np.random.Generator,
+               t: int = 0,
+               global_last_visit_time: np.ndarray | None = None) -> None:
+    """
+    Advance one robot by one simulation step.
+
+    The key paper-consistent design choice is that the discrete Markov update is
+    triggered only when the robot physically arrives at the centre of its target
+    region. Between arrivals the state ``from_k`` is frozen, so convergence is
+    measured in Markov time, i.e. number of arrivals, rather than raw simulation
+    steps.
+    """
+    robot_map = ensure_robot_map(r, w)
     dx = r.tx - r.x
     dy = r.ty - r.y
     dist = math.sqrt(dx * dx + dy * dy)
@@ -210,6 +538,9 @@ def step_robot(r: Robot, w: World, P: np.ndarray,
         # Record arrival — this is the "visit" counted in c_k(t):
         #   c_k(t) = (# arrivals at k up to Markov-time t) / (total arrivals)
         markov_visits[r.from_k] += 1
+        robot_map.observe_cell(r.from_k, float(t))
+        if global_last_visit_time is not None:
+            global_last_visit_time[r.from_k] = float(t)
 
         # ── MAXCAL TRANSITION: sample p*(k2 | from_k), Eq.(1) ───
         next_k = sample_next_region(w, r.from_k, P, rng)
@@ -223,36 +554,94 @@ def step_robot(r: Robot, w: World, P: np.ndarray,
 
 @dataclass
 class SimResult:
+    """Outputs recorded from one Layer 1-C run for theory checks and figures."""
     w: World
     pi_empirical: np.ndarray
     ck_history: List[np.ndarray]                              # c_k(t) snapshots
     markov_step_history: List[int]                            # total arrivals at each snapshot
     pos_snapshots: List[Tuple[np.ndarray, np.ndarray, int]]   # (xs, ys, t)
+    lambda_C: np.ndarray | None = None
+    target_pi: np.ndarray | None = None
+    target_mode: str = "degree"
+    inverse_solution: InverseCoverageSolution | None = None
+    t_axis: np.ndarray | None = None
+    mean_global_coverage_age: np.ndarray | None = None
+    mean_local_coverage_age: np.ndarray | None = None
+    mean_local_map_record_age: np.ndarray | None = None
 
 
 def run_simulation(speed: float = ROBOT_SPEED,
                    T: int = T_SIM,
                    lambda_C_val: float = LAMBDA_C_VAL,
-                   seed: int = SEED) -> SimResult:
+                   seed: int = SEED,
+                   target_mode: str = "degree",
+                   target_pi: np.ndarray | None = None,
+                   lambda_C: np.ndarray | None = None,
+                   inverse_tol: float = INVERSE_SOLVER_TOL,
+                   inverse_max_iters: int = INVERSE_SOLVER_MAX_ITERS) -> SimResult:
+    """
+    Run the Layer 1-C controller and record both Markov and age observables.
+
+    ``markov_visits`` stores the arrival counts c_k(t) used by the paper-level
+    coverage validation. ``global_last_visit_time`` stores the globally observed
+    last visit of each cell and is used only to compute the global coverage-age
+    diagnostic. The per-robot local maps evolve independently and expose the
+    local coverage-age observable needed by the later hierarchical controller.
+    """
     rng = np.random.default_rng(seed)
     w = build_world(NX, NY, CELL_SIZE)
-    lambda_C = np.full(w.K, lambda_C_val)
-    P = build_transition_matrix(w, lambda_C)
+    controller = build_coverage_controller(
+        w=w,
+        target_mode=target_mode,
+        lambda_C_val=lambda_C_val,
+        target_pi=target_pi,
+        lambda_C=lambda_C,
+        tol=inverse_tol,
+        max_iters=inverse_max_iters,
+    )
+    P = controller.transition
 
     robots = [make_robot(i, w, P, rng) for i in range(N_ROBOTS)]
     markov_visits = np.zeros(w.K, dtype=np.int64)
+    global_last_visit_time = np.full(w.K, -1.0, dtype=np.float64)
+    for robot in robots:
+        global_last_visit_time[robot.from_k] = 0.0
+
     ck_history: List[np.ndarray] = []
     ms_history: List[int] = []
     pos_snapshots: List[Tuple[np.ndarray, np.ndarray, int]] = []
+    t_axis: List[int] = []
+    global_cov_age_history: List[float] = []
+    local_cov_age_history: List[float] = []
+    local_map_record_age_history: List[float] = []
 
     for t in range(1, T + 1):
         for r in robots:
-            step_robot(r, w, P, speed, markov_visits, rng)
+            step_robot(
+                r,
+                w,
+                P,
+                speed,
+                markov_visits,
+                rng,
+                t=t,
+                global_last_visit_time=global_last_visit_time,
+            )
 
         total = int(markov_visits.sum())
         if t % RECORD_EVERY == 0 and total > 0:
             ck_history.append(markov_visits / total)
             ms_history.append(total)
+            maps = [ensure_robot_map(robot, w) for robot in robots]
+            global_cov_age = np.where(
+                global_last_visit_time >= 0.0,
+                float(t) - global_last_visit_time,
+                float(t) + 1.0,
+            )
+            t_axis.append(t)
+            global_cov_age_history.append(float(np.mean(global_cov_age)))
+            local_cov_age_history.append(mean_robot_coverage_age(maps, float(t)))
+            local_map_record_age_history.append(mean_robot_map_record_age(maps, float(t)))
 
         if t % SNAP_EVERY == 0:
             xs = np.array([r.x for r in robots])
@@ -260,7 +649,21 @@ def run_simulation(speed: float = ROBOT_SPEED,
             pos_snapshots.append((xs, ys, t))
 
     pi_emp = markov_visits / markov_visits.sum()
-    return SimResult(w, pi_emp, ck_history, ms_history, pos_snapshots)
+    return SimResult(
+        w,
+        pi_emp,
+        ck_history,
+        ms_history,
+        pos_snapshots,
+        controller.lambda_C,
+        controller.target_pi,
+        controller.target_mode,
+        controller.inverse_solution,
+        np.array(t_axis, dtype=np.int64),
+        np.array(global_cov_age_history, dtype=np.float64),
+        np.array(local_cov_age_history, dtype=np.float64),
+        np.array(local_map_record_age_history, dtype=np.float64),
+    )
 
 
 # ============================================================
@@ -269,7 +672,7 @@ def run_simulation(speed: float = ROBOT_SPEED,
 
 def make_main_figure(res: SimResult):
     w = res.w
-    pi_theory = theoretical_stationary(w)
+    pi_theory = res.target_pi if res.target_pi is not None else theoretical_stationary(w)
     pi_emp = res.pi_empirical
 
     # Representative regions (one of each degree class)
@@ -277,8 +680,12 @@ def make_main_figure(res: SimResult):
     k_edge = NX // 2                              # bottom-edge middle → degree 5
     k_interior = (NY // 2) * NX + NX // 2        # centre → degree 8
 
-    vmin = float(pi_theory.min())
-    vmax = float(pi_theory.max())
+    vmin = min(float(pi_theory.min()), float(pi_emp.min()))
+    vmax = max(float(pi_theory.max()), float(pi_emp.max()))
+    if math.isclose(vmin, vmax):
+        pad = max(abs(vmin) * 0.05, 1.0e-6)
+        vmin -= pad
+        vmax += pad
 
     fig = plt.figure(figsize=(14, 9))
     gs = fig.add_gridspec(2, 3)
@@ -286,7 +693,12 @@ def make_main_figure(res: SimResult):
     ax1 = fig.add_subplot(gs[0, 0])
     im1 = ax1.imshow(pi_theory.reshape(w.Ny, w.Nx), origin="lower",
                      cmap="viridis", vmin=vmin, vmax=vmax)
-    ax1.set_title("(a) Theoretical π̄_k ∝ deg(k)")
+    if res.target_mode == "uniform":
+        ax1.set_title("(a) Target π̄_k = 1/K")
+    elif res.target_mode == "degree":
+        ax1.set_title("(a) Target π̄_k ∝ deg(k)")
+    else:
+        ax1.set_title(f"(a) Target π̄_k ({res.target_mode})")
     ax1.set_xlabel("col"); ax1.set_ylabel("row")
     fig.colorbar(im1, ax=ax1, fraction=0.046)
 
@@ -329,7 +741,15 @@ def make_main_figure(res: SimResult):
     ax5.set_title(f"(e) Robot positions  t={t_end}")
     ax5.set_xlabel("x (m)"); ax5.set_ylabel("y (m)")
 
-    fig.suptitle("MaxCal Coverage (Sec. 4.2.1) — symmetric λ_C, 8-connected grid")
+    if res.inverse_solution is None:
+        title_suffix = "forward λ_C"
+    else:
+        title_suffix = (
+            "inverse MaxCal "
+            f"(iters={res.inverse_solution.iterations}, "
+            f"L1={res.inverse_solution.l1_stationary_error:.2e})"
+        )
+    fig.suptitle(f"MaxCal Coverage — {res.target_mode} target, {title_suffix}")
     fig.tight_layout()
     return fig
 
@@ -427,8 +847,8 @@ def main():
     print(f"  Duration: {T_SIM} steps")
     print()
 
-    print("Running simulation...")
-    result = run_simulation()
+    print("Running baseline coverage simulation (lambda_C = 0)...")
+    result = run_simulation(target_mode="degree")
     print(f"  Done. Total Markov steps: {result.markov_step_history[-1]}")
     print(f"  Expected per robot: ~{round(result.markov_step_history[-1] / N_ROBOTS)}")
     print()
@@ -438,10 +858,25 @@ def main():
     fig_main.savefig("maxcal_coverage_main.png", dpi=120)
     plt.close(fig_main)
 
+    print("Running inverse-MaxCal uniform-coverage simulation...")
+    uniform_result = run_simulation(target_mode="uniform")
+    if uniform_result.inverse_solution is not None:
+        sol = uniform_result.inverse_solution
+        print(
+            "  Solver: "
+            f"converged={sol.converged}, iterations={sol.iterations}, "
+            f"L1={sol.l1_stationary_error:.3e}"
+        )
+
+    print("Saving inverse-MaxCal figure → maxcal_coverage_uniform_main.png")
+    fig_uniform = make_main_figure(uniform_result)
+    fig_uniform.savefig("maxcal_coverage_uniform_main.png", dpi=120)
+    plt.close(fig_uniform)
+
     print("Saving animation → maxcal_coverage.gif")
     make_animation(result)
 
-    print("Saving phase diagram (runs 5 additional simulations)...")
+    print("Saving phase diagram...")
     fig_phase = make_phase_figure()
     fig_phase.savefig("maxcal_coverage_phase.png", dpi=120)
     plt.close(fig_phase)
@@ -449,9 +884,6 @@ def main():
 
     print()
     print("Done. Open the .png files to inspect results.")
-    print("Expected: empirical π̂_k closely tracks theoretical π̄_k ∝ deg(k).")
-    print("          Interior cells visited ~8/5 ≈ 1.6× more than edge cells.")
-    print("          Corner cells visited ~3/8 ≈ 0.375× as often as interior.")
 
 
 if __name__ == "__main__":

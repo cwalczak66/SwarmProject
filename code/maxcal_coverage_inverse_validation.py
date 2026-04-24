@@ -3,24 +3,25 @@ Inverse-MaxCal validation for uniform coverage on an irregular grid.
 
 The existing coverage validator tests the forward case lambda_C^k = constant:
 the MaxCal kernel reduces to a uniform random walk and therefore has
-stationary distribution pi_k proportional to the cell degree. This script
-tests the complementary inverse problem:
+stationary distribution π_k proportional to the cell degree. This script
+tests the complementary inverse problem using the reusable inverse solver in
+``maxcal_coverage.py``:
 
-    target first  -> solve lambda_C^k  -> build P  -> verify pi_k = target
+target first  -> solve lambda_C^k  -> build P  -> verify π_k = target
 
 For the 20 x 20 8-connected grid, the target is uniform coverage,
-rho_k = 1 / K. The MaxCal transition kernel is
+π_k = 1 / K. The MaxCal transition kernel is
 
     P_ij = A_ij exp(-lambda_j) / sum_l A_il exp(-lambda_l),
 
 where A is the undirected adjacency matrix and unit edge weights are used.
 Writing b_j = exp(-lambda_j), reversibility gives the stationary distribution
 
-    pi_i(b) = b_i (A b)_i / sum_m b_m (A b)_m.
+    π_i(b) = b_i (A b)_i / sum_m b_m (A b)_m.
 
 Thus the inverse problem is the positive matrix-scaling equation
 
-    b_i (A b)_i proportional to rho_i.
+    b_i (A b)_i proportional to π_i.
 
 The solved lambda map is global/offline design knowledge. The robots still
 execute only the local transition rule by looking up the precomputed
@@ -34,7 +35,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 import tempfile
 from dataclasses import asdict, dataclass
@@ -142,10 +142,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def adjacency_matrix(world: mc.World) -> np.ndarray:
-    adjacency = np.zeros((world.K, world.K), dtype=np.float64)
-    for k, neighbors in enumerate(world.adjacency):
-        adjacency[k, neighbors] = 1.0
-    return adjacency
+    return mc.adjacency_matrix(world)
 
 
 def stationary_from_b(adjacency: np.ndarray, b: np.ndarray) -> np.ndarray:
@@ -160,13 +157,7 @@ def stationary_from_lambda(adjacency: np.ndarray, lambda_c: np.ndarray) -> np.nd
 
 
 def power_stationary(transition: np.ndarray, tol: float = 1e-14, max_iters: int = 200_000) -> np.ndarray:
-    pi = np.full(transition.shape[0], 1.0 / transition.shape[0], dtype=np.float64)
-    for _ in range(max_iters):
-        nxt = pi @ transition
-        if float(np.max(np.abs(nxt - pi))) < tol:
-            return nxt / nxt.sum()
-        pi = nxt
-    return pi / pi.sum()
+    return mc.power_stationary_distribution(transition, tol=tol, max_iters=max_iters)
 
 
 def solve_uniform_target_multipliers(
@@ -183,7 +174,7 @@ def solve_uniform_target_multipliers(
     b = np.ones_like(target)
     error_history: List[float] = []
     converged = False
-    err = math.inf
+    err = float("inf")
     it = 0
 
     for it in range(max_iters + 1):
@@ -238,33 +229,16 @@ def run_simulation_with_lambda(
     speed: float,
     T: int,
     seed: int,
+    target: np.ndarray | None = None,
 ) -> mc.SimResult:
-    rng = np.random.default_rng(seed)
-    world = mc.build_world(mc.NX, mc.NY, mc.CELL_SIZE)
-    transition = mc.build_transition_matrix(world, lambda_c)
-
-    robots = [mc.make_robot(i, world, transition, rng) for i in range(mc.N_ROBOTS)]
-    markov_visits = np.zeros(world.K, dtype=np.int64)
-    ck_history: List[np.ndarray] = []
-    markov_step_history: List[int] = []
-    pos_snapshots: List[Tuple[np.ndarray, np.ndarray, int]] = []
-
-    for t in range(1, T + 1):
-        for robot in robots:
-            mc.step_robot(robot, world, transition, speed, markov_visits, rng)
-
-        total = int(markov_visits.sum())
-        if t % mc.RECORD_EVERY == 0 and total > 0:
-            ck_history.append(markov_visits / total)
-            markov_step_history.append(total)
-
-        if t % mc.SNAP_EVERY == 0:
-            xs = np.array([robot.x for robot in robots])
-            ys = np.array([robot.y for robot in robots])
-            pos_snapshots.append((xs, ys, t))
-
-    pi_empirical = markov_visits / markov_visits.sum()
-    return mc.SimResult(world, pi_empirical, ck_history, markov_step_history, pos_snapshots)
+    return mc.run_simulation(
+        speed=speed,
+        T=T,
+        seed=seed,
+        target_mode="explicit_lambda",
+        lambda_C=lambda_c,
+        target_pi=target,
+    )
 
 
 def degree_array(world: mc.World) -> np.ndarray:
@@ -397,7 +371,7 @@ def make_maps_figure(
         ("(c) Optimized stationary pi", optimized_pi, "viridis", pi_vmin, pi_vmax),
         ("(d) Optimized lambda_C map", lambda_c, "coolwarm", None, None),
         ("(e) Empirical optimized visits", empirical_pi, "viridis", pi_vmin, pi_vmax),
-        ("(f) Empirical |pi_hat - rho|", np.abs(empirical_pi - target), "Reds", None, None),
+        ("(f) Empirical |π̂_k - π|", np.abs(empirical_pi - target), "Reds", None, None),
     ]
 
     for ax, (title, values, cmap, vmin, vmax) in zip(axes.flat, panels):
@@ -654,8 +628,8 @@ def save_summary(
         },
         "theory": {
             "kernel": "P_ij = A_ij exp(-lambda_j) / sum_l A_il exp(-lambda_l)",
-            "stationary_formula": "pi_i = b_i (A b)_i / sum_m b_m (A b)_m, b_i = exp(-lambda_i)",
-            "inverse_condition": "For uniform rho, solve b_i (A b)_i = constant for every cell.",
+            "stationary_formula": "π_i = b_i (A b)_i / sum_m b_m (A b)_m, b_i = exp(-lambda_i)",
+            "inverse_condition": "For uniform π, solve b_i (A b)_i = constant for every cell.",
             "interpretation": (
                 "Lower lambda_C means larger exp(-lambda_C), so the cell is made more attractive. "
                 "Boundary cells need lower lambda_C to compensate for fewer neighbors."
@@ -725,15 +699,24 @@ def main() -> None:
 
     world = mc.build_world(mc.NX, mc.NY, mc.CELL_SIZE)
     adjacency = adjacency_matrix(world)
-    target = np.full(world.K, 1.0 / world.K, dtype=np.float64)
+    target = mc.uniform_stationary(world)
     baseline_pi = mc.theoretical_stationary(world)
 
-    lambda_c, optimized_pi, solver, error_history = solve_uniform_target_multipliers(
-        adjacency=adjacency,
-        target=target,
+    inverse_solution = mc.solve_coverage_multipliers_for_target(
+        w=world,
+        target_pi=target,
         tol=args.tol,
         max_iters=args.max_iters,
     )
+    lambda_c = inverse_solution.lambda_C
+    optimized_pi = inverse_solution.stationary
+    solver = SolverResult(
+        iterations=inverse_solution.iterations,
+        max_abs_stationary_error=inverse_solution.max_abs_stationary_error,
+        l1_stationary_error=inverse_solution.l1_stationary_error,
+        converged=inverse_solution.converged,
+    )
+    error_history = inverse_solution.error_history
     optimized_transition = mc.build_transition_matrix(world, lambda_c)
     checks = transition_checks(world, optimized_transition)
     power_pi = power_stationary(optimized_transition)
@@ -758,6 +741,7 @@ def main() -> None:
             speed=args.speed,
             T=args.T,
             seed=args.seed + offset,
+            target=target,
         )
         case_results.append(
             {
