@@ -1,34 +1,30 @@
 """
-Inverse-MaxCal validation for uniform coverage on an irregular grid.
+RBE 511 Swarm Intelligence Final Project - MaxCal-Derived Swarm Control: Emergent Oscillation Between Coverage and Information Diffusion
 
-The existing coverage validator tests the forward case lambda_C^k = constant:
-the MaxCal kernel reduces to a uniform random walk and therefore has
-stationary distribution π_k proportional to the cell degree. This script
-tests the complementary inverse problem using the reusable inverse solver in
-``maxcal_coverage.py``:
+Author: Filippo Marcantoni (fmarcantoni@wpi.edu), Pau Alcolea (palcolea@wpi.edu), Chris Walczak (cwalczak2@wpi.edu)
+Course: RBE 511 - Swarm Intelligence (Prof. Carlo Pinciroli)
+Institution: Worcester Polytechnic Institute  
 
-target first  -> solve lambda_C^k  -> build P  -> verify π_k = target
+-------------------------------------------------------------------------------------------------------------------------------------------
 
-For the 20 x 20 8-connected grid, the target is uniform coverage,
-π_k = 1 / K. The MaxCal transition kernel is
+Validate inverse MaxCal coverage for a uniform stationary target.
+The forward baseline ``lambda_C=0`` gives the degree-biased stationary law
 
-    P_ij = A_ij exp(-lambda_j) / sum_l A_il exp(-lambda_l),
+    pi_i = deg(i) / sum_m deg(m),
 
-where A is the undirected adjacency matrix and unit edge weights are used.
-Writing b_j = exp(-lambda_j), reversibility gives the stationary distribution
+which is not uniform on a finite 8-connected grid because corners, edges, and
+interior cells have different degrees.  The inverse problem asks for
 
-    π_i(b) = b_i (A b)_i / sum_m b_m (A b)_m.
+    pi_bar_i = 1/K,
+    pi_i(b) = b_i(A b)_i / sum_m b_m(A b)_m = pi_bar_i,
+    b_i = exp[-lambda_C,i].
 
-Thus the inverse problem is the positive matrix-scaling equation
-
-    b_i (A b)_i proportional to π_i.
-
-The solved lambda map is global/offline design knowledge. The robots still
-execute only the local transition rule by looking up the precomputed
-lambda_C value of neighboring cells.
-
-Usage:
-    venv/bin/python maxcal_coverage_uniform_target_validation.py
+The solved per-cell ``lambda_C`` is an offline design object; each robot still
+executes the same local rule by reading the multiplier values of neighboring
+destinations.  The degree-tied controller in this script is only a diagnostic:
+it shows the corner/edge/interior ordering, but cannot exactly solve the
+uniform target because equal-degree cells can have different neighbor
+compositions.
 """
 
 from __future__ import annotations
@@ -39,7 +35,7 @@ import os
 import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Any
 
 os.environ.setdefault("MPLCONFIGDIR", str(Path(tempfile.gettempdir()) / "mplconfig"))
 os.environ.setdefault("XDG_CACHE_HOME", tempfile.gettempdir())
@@ -51,38 +47,16 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
+import maxcal_core as core
 import maxcal_coverage as mc
 
 
-@dataclass
-class SolverResult:
-    iterations: int
-    max_abs_stationary_error: float
-    l1_stationary_error: float
-    converged: bool
-
-
-@dataclass
-class DegreeClassStats:
-    degree: int
-    n_cells: int
-    mean: float
-    minimum: float
-    maximum: float
-    std: float
-
-
-@dataclass
-class RepresentativeCell:
-    label: str
-    index: int
-    degree: int
-    target_pi: float
-    baseline_pi: float
-    optimized_theory_pi: float
-    optimized_empirical_pi: float
-    optimized_empirical_abs_error: float
-    lambda_C: float
+FIGURES = [
+    "maxcal_coverage_uniform_target_maps.png",
+    "maxcal_coverage_uniform_target_cases.png",
+    "maxcal_coverage_uniform_target_degree_classes.png",
+    "maxcal_coverage_uniform_target_degree_traces.png",
+]
 
 
 @dataclass
@@ -95,142 +69,158 @@ class DegreeTiedFit:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Solve and validate MaxCal coverage multipliers for a uniform stationary target."
-    )
-    parser.add_argument(
-        "--outdir",
-        type=str,
-        default="maxcal_coverage_uniform_target_validation",
-        help="Directory for summary, raw arrays, and figures.",
-    )
-    parser.add_argument(
-        "--T",
-        type=int,
-        default=60_000,
-        help=(
-            "Simulation length for the empirical optimized-kernel check. "
-            "This is longer than the baseline Layer 1-C run because a flat "
-            "400-cell target needs more arrivals for a low-noise histogram."
-        ),
-    )
-    parser.add_argument(
-        "--speed",
-        type=float,
-        default=mc.ROBOT_SPEED,
-        help="Robot speed in m/step for the empirical check.",
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=mc.SEED + 1000,
-        help="Random seed for the empirical check.",
-    )
-    parser.add_argument(
-        "--tol",
-        type=float,
-        default=1e-12,
-        help="Max absolute stationary error tolerance for the inverse solver.",
-    )
-    parser.add_argument(
-        "--max-iters",
-        type=int,
-        default=100_000,
-        help="Maximum iterations for the inverse solver.",
-    )
+    parser = argparse.ArgumentParser(description="Validate inverse MaxCal coverage for a uniform target.")
+    parser.add_argument("--outdir", type=str, default="maxcal_coverage_uniform_target_validation")
+    parser.add_argument("--T", type=int, default=60_000)
+    parser.add_argument("--speed", type=float, default=mc.ROBOT_SPEED)
+    parser.add_argument("--seed", type=int, default=mc.SEED + 1000)
+    parser.add_argument("--tol", type=float, default=1.0e-12)
+    parser.add_argument("--max-iters", type=int, default=100_000)
     return parser.parse_args()
 
 
-def adjacency_matrix(world: mc.World) -> np.ndarray:
-    return mc.adjacency_matrix(world)
+def json_safe(value: Any) -> Any:
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if hasattr(value, "__dataclass_fields__"):
+        return asdict(value)
+    if isinstance(value, dict):
+        return {key: json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(item) for item in value]
+    return value
 
 
-def stationary_from_b(adjacency: np.ndarray, b: np.ndarray) -> np.ndarray:
-    raw = b * (adjacency @ b)
-    return raw / raw.sum()
+def degree_array(world: mc.World) -> np.ndarray:
+    """Return the graph degree of every cell."""
+    return np.array([len(neighbors) for neighbors in world.adjacency], dtype=np.int64)
 
 
-def stationary_from_lambda(adjacency: np.ndarray, lambda_c: np.ndarray) -> np.ndarray:
-    shifted = lambda_c - float(np.mean(lambda_c))
-    b = np.exp(-shifted)
-    return stationary_from_b(adjacency, b)
+def lambda_from_degree_params(params: np.ndarray, degree_values: np.ndarray, degrees: np.ndarray) -> np.ndarray:
+    """Expand three degree-class parameters into a mean-zero multiplier field."""
+    lambda_c = np.zeros_like(degrees, dtype=np.float64)
+    for idx, degree in enumerate(degree_values):
+        lambda_c[degrees == degree] = float(params[idx])
+    lambda_c -= float(lambda_c.mean())
+    return lambda_c
 
 
-def power_stationary(transition: np.ndarray, tol: float = 1e-14, max_iters: int = 200_000) -> np.ndarray:
-    return mc.power_stationary_distribution(transition, tol=tol, max_iters=max_iters)
-
-
-def solve_uniform_target_multipliers(
-    adjacency: np.ndarray,
+def optimize_degree_tied_multipliers(
+    world: mc.World,
     target: np.ndarray,
-    tol: float,
-    max_iters: int,
-) -> Tuple[np.ndarray, np.ndarray, SolverResult, np.ndarray]:
-    target = np.asarray(target, dtype=np.float64)
-    target = target / target.sum()
-    if np.any(target <= 0.0):
-        raise ValueError("The inverse scaling solver requires a strictly positive target distribution.")
+    initial_lambda: np.ndarray,
+    min_step: float = 1.0e-8,
+    max_iters: int = 20_000,
+) -> tuple[np.ndarray, np.ndarray, DegreeTiedFit]:
+    """Best diagnostic fit using one ``lambda_C`` per degree class.
 
-    b = np.ones_like(target)
-    error_history: List[float] = []
-    converged = False
-    err = float("inf")
-    it = 0
+    The full inverse solve has one multiplier per cell.  This reduced fit is
+    intentionally not the production controller; it isolates the intuitive
+    boundary effect predicted by the stationary formula.
+    """
+    degrees = degree_array(world)
+    degree_values = np.array(sorted(np.unique(degrees)), dtype=np.int64)
+    params = np.array([initial_lambda[degrees == degree].mean() for degree in degree_values], dtype=np.float64)
 
-    for it in range(max_iters + 1):
-        pi = stationary_from_b(adjacency, b)
-        err = float(np.max(np.abs(pi - target)))
-        error_history.append(err)
-        if err < tol:
-            converged = True
-            break
+    def evaluate(candidate: np.ndarray) -> tuple[float, np.ndarray, np.ndarray]:
+        lambda_c = lambda_from_degree_params(candidate, degree_values, degrees)
+        pi = mc.stationary_from_lambda(world, lambda_c)
+        diff = pi - target
+        return float(np.dot(diff, diff)), lambda_c, pi
 
-        # Symmetric proportional fitting. If a cell is underrepresented,
-        # increase b_i = exp(-lambda_i); if overrepresented, decrease it.
-        update = np.sqrt(target / np.maximum(pi, 1e-300))
-        b *= update
+    best_obj, best_lambda, best_pi = evaluate(params)
+    step = 0.5
+    iterations = 0
+    while step > min_step and iterations < max_iters:
+        improved = False
+        for dim in range(len(params)):
+            for direction in (1.0, -1.0):
+                candidate = params.copy()
+                candidate[dim] += direction * step
+                obj, lambda_c, pi = evaluate(candidate)
+                iterations += 1
+                if obj < best_obj:
+                    params, best_obj, best_lambda, best_pi = candidate, obj, lambda_c, pi
+                    improved = True
+                    break
+            if improved:
+                break
+        if not improved:
+            step *= 0.5
 
-        # Fix the arbitrary gauge: multiplying every b_i by the same constant
-        # leaves every transition probability unchanged.
-        b /= np.exp(float(np.mean(np.log(b))))
-
-    lambda_c = -np.log(b)
-    lambda_c -= float(np.mean(lambda_c))
-    pi = stationary_from_lambda(adjacency, lambda_c)
-    solver = SolverResult(
-        iterations=int(it),
-        max_abs_stationary_error=float(np.max(np.abs(pi - target))),
-        l1_stationary_error=float(np.sum(np.abs(pi - target))),
-        converged=bool(converged),
+    fit = DegreeTiedFit(
+        iterations=iterations,
+        final_step=step,
+        objective_l2=best_obj,
+        l1_stationary_error=core.l1_error(best_pi, target),
+        max_abs_stationary_error=float(np.max(np.abs(best_pi - target))),
     )
-    return lambda_c, pi, solver, np.array(error_history, dtype=np.float64)
+    return best_lambda, best_pi, fit
 
 
-def transition_checks(world: mc.World, transition: np.ndarray) -> Dict[str, float]:
-    row_sums = transition.sum(axis=1)
-    off_neighbor_mask = np.ones_like(transition, dtype=bool)
-    for k in range(world.K):
-        off_neighbor_mask[k, world.adjacency[k]] = False
-        off_neighbor_mask[k, k] = False
+def transition_checks(world: mc.World, transition: np.ndarray) -> dict[str, float]:
+    """Check stochastic rows and neighbor-only support of the solved kernel."""
+    off_neighbor = np.ones_like(transition, dtype=bool)
+    for cell, neighbors in enumerate(world.adjacency):
+        off_neighbor[cell, neighbors] = False
+        off_neighbor[cell, cell] = False
+    positive = np.concatenate([transition[cell, neighbors] for cell, neighbors in enumerate(world.adjacency)])
     return {
-        "max_row_sum_error": float(np.max(np.abs(row_sums - 1.0))),
-        "max_off_neighbor_probability": float(np.max(np.abs(transition[off_neighbor_mask]))),
-        "minimum_positive_neighbor_probability": float(
-            min(np.min(transition[k, world.adjacency[k]]) for k in range(world.K))
-        ),
-        "maximum_neighbor_probability": float(
-            max(np.max(transition[k, world.adjacency[k]]) for k in range(world.K))
-        ),
+        "max_row_sum_error": float(np.max(np.abs(transition.sum(axis=1) - 1.0))),
+        "max_off_neighbor_probability": float(np.max(np.abs(transition[off_neighbor]))),
+        "minimum_positive_neighbor_probability": float(np.min(positive)),
+        "maximum_neighbor_probability": float(np.max(positive)),
     }
 
 
-def run_simulation_with_lambda(
+def stats_by_degree(values: np.ndarray, degrees: np.ndarray) -> dict[str, dict[str, float | int]]:
+    stats: dict[str, dict[str, float | int]] = {}
+    for degree in sorted(np.unique(degrees)):
+        group = np.asarray(values[degrees == degree], dtype=np.float64)
+        stats[str(int(degree))] = {
+            "degree": int(degree),
+            "n_cells": int(len(group)),
+            "mean": float(group.mean()),
+            "min": float(group.min()),
+            "max": float(group.max()),
+            "std": float(group.std()),
+        }
+    return stats
+
+
+def representative_cells(
+    world: mc.World,
+    target: np.ndarray,
+    baseline: np.ndarray,
+    degree_tied: np.ndarray,
+    full: np.ndarray,
+    empirical: np.ndarray,
     lambda_c: np.ndarray,
-    speed: float,
-    T: int,
-    seed: int,
-    target: np.ndarray | None = None,
-) -> mc.SimResult:
+) -> dict[str, dict[str, float | int]]:
+    reps = {
+        "corner": 0,
+        "edge": mc.NX // 2,
+        "interior": (mc.NY // 2) * mc.NX + mc.NX // 2,
+    }
+    return {
+        label: {
+            "index": int(cell),
+            "degree": int(len(world.adjacency[cell])),
+            "target_pi": float(target[cell]),
+            "baseline_pi": float(baseline[cell]),
+            "degree_tied_pi": float(degree_tied[cell]),
+            "full_theory_pi": float(full[cell]),
+            "full_empirical_pi": float(empirical[cell]),
+            "full_empirical_abs_error": float(abs(empirical[cell] - target[cell])),
+            "lambda_C": float(lambda_c[cell]),
+        }
+        for label, cell in reps.items()
+    }
+
+
+def run_with_lambda(lambda_c: np.ndarray, target: np.ndarray, speed: float, T: int, seed: int) -> mc.SimResult:
     return mc.run_simulation(
         speed=speed,
         T=T,
@@ -241,115 +231,26 @@ def run_simulation_with_lambda(
     )
 
 
-def degree_array(world: mc.World) -> np.ndarray:
-    return np.array([len(neighbors) for neighbors in world.adjacency], dtype=np.int64)
-
-
-def stats_by_degree(values: np.ndarray, degrees: np.ndarray) -> Dict[str, DegreeClassStats]:
-    result: Dict[str, DegreeClassStats] = {}
-    for degree in sorted(int(d) for d in np.unique(degrees)):
-        mask = degrees == degree
-        selected = values[mask]
-        result[str(degree)] = DegreeClassStats(
-            degree=degree,
-            n_cells=int(mask.sum()),
-            mean=float(np.mean(selected)),
-            minimum=float(np.min(selected)),
-            maximum=float(np.max(selected)),
-            std=float(np.std(selected)),
-        )
-    return result
-
-
-def representative_cells(
-    world: mc.World,
-    target: np.ndarray,
-    baseline_pi: np.ndarray,
-    optimized_pi: np.ndarray,
-    empirical_pi: np.ndarray,
-    lambda_c: np.ndarray,
-) -> Dict[str, RepresentativeCell]:
-    reps = {
-        "corner": 0,
-        "edge": mc.NX // 2,
-        "interior": (mc.NY // 2) * mc.NX + mc.NX // 2,
+def save_raw_data(outdir: Path, payload: dict[str, Any]) -> None:
+    arrays: dict[str, np.ndarray] = {
+        "target": payload["target"],
+        "baseline_pi": payload["baseline_pi"],
+        "degree_tied_pi": payload["degree_tied_pi"],
+        "full_pi": payload["full_pi"],
+        "full_empirical_pi": payload["empirical_pi"],
+        "lambda_C": payload["lambda_C"],
+        "degree_tied_lambda_C": payload["degree_tied_lambda_C"],
+        "solver_error_history": payload["solution"].error_history,
     }
-    output: Dict[str, RepresentativeCell] = {}
-    for label, idx in reps.items():
-        output[label] = RepresentativeCell(
-            label=label,
-            index=idx,
-            degree=len(world.adjacency[idx]),
-            target_pi=float(target[idx]),
-            baseline_pi=float(baseline_pi[idx]),
-            optimized_theory_pi=float(optimized_pi[idx]),
-            optimized_empirical_pi=float(empirical_pi[idx]),
-            optimized_empirical_abs_error=float(abs(empirical_pi[idx] - target[idx])),
-            lambda_C=float(lambda_c[idx]),
-        )
-    return output
-
-
-def lambda_from_degree_params(params: np.ndarray, degree_values: np.ndarray, degrees: np.ndarray) -> np.ndarray:
-    lambda_c = np.zeros_like(degrees, dtype=np.float64)
-    for idx, degree in enumerate(degree_values):
-        lambda_c[degrees == degree] = float(params[idx])
-    lambda_c -= float(np.mean(lambda_c))
-    return lambda_c
-
-
-def optimise_degree_tied_multipliers(
-    adjacency: np.ndarray,
-    target: np.ndarray,
-    degrees: np.ndarray,
-    initial_lambda_c: np.ndarray,
-    min_step: float = 1e-8,
-    max_iters: int = 20_000,
-) -> Tuple[np.ndarray, np.ndarray, DegreeTiedFit]:
-    degree_values = np.array(sorted(int(d) for d in np.unique(degrees)), dtype=np.int64)
-    params = np.array(
-        [float(np.mean(initial_lambda_c[degrees == degree])) for degree in degree_values],
-        dtype=np.float64,
-    )
-
-    def evaluate(candidate_params: np.ndarray) -> Tuple[float, np.ndarray, np.ndarray]:
-        candidate_lambda = lambda_from_degree_params(candidate_params, degree_values, degrees)
-        candidate_pi = stationary_from_lambda(adjacency, candidate_lambda)
-        diff = candidate_pi - target
-        return float(np.dot(diff, diff)), candidate_lambda, candidate_pi
-
-    best_obj, best_lambda, best_pi = evaluate(params)
-    step = 0.5
-    iterations = 0
-
-    while step > min_step and iterations < max_iters:
-        improved = False
-        for dim in range(len(params)):
-            for direction in (1.0, -1.0):
-                candidate = params.copy()
-                candidate[dim] += direction * step
-                obj, candidate_lambda, candidate_pi = evaluate(candidate)
-                iterations += 1
-                if obj < best_obj:
-                    params = candidate
-                    best_obj = obj
-                    best_lambda = candidate_lambda
-                    best_pi = candidate_pi
-                    improved = True
-                    break
-            if improved:
-                break
-        if not improved:
-            step *= 0.5
-
-    fit = DegreeTiedFit(
-        iterations=int(iterations),
-        final_step=float(step),
-        objective_l2=float(best_obj),
-        l1_stationary_error=float(np.sum(np.abs(best_pi - target))),
-        max_abs_stationary_error=float(np.max(np.abs(best_pi - target))),
-    )
-    return best_lambda, best_pi, fit
+    for case in payload["cases"]:
+        result: mc.SimResult = case["result"]
+        prefix = f"case_{case['key']}"
+        arrays[f"{prefix}_lambda_C"] = np.asarray(case["lambda_C"], dtype=np.float64)
+        arrays[f"{prefix}_theory_pi"] = np.asarray(case["theory_pi"], dtype=np.float64)
+        arrays[f"{prefix}_empirical_pi"] = result.pi_empirical
+        arrays[f"{prefix}_markov_steps"] = np.asarray(result.markov_step_history, dtype=np.int64)
+        arrays[f"{prefix}_ck_history"] = np.asarray(result.ck_history, dtype=np.float64)
+    np.savez_compressed(outdir / "maxcal_coverage_uniform_target_raw_data.npz", **arrays)
 
 
 def make_maps_figure(
@@ -357,31 +258,29 @@ def make_maps_figure(
     world: mc.World,
     baseline_pi: np.ndarray,
     target: np.ndarray,
-    optimized_pi: np.ndarray,
+    full_pi: np.ndarray,
     lambda_c: np.ndarray,
     empirical_pi: np.ndarray,
 ) -> None:
     fig, axes = plt.subplots(2, 3, figsize=(14.0, 8.2))
-    pi_vmin = min(float(baseline_pi.min()), float(target.min()), float(optimized_pi.min()))
-    pi_vmax = max(float(baseline_pi.max()), float(target.max()), float(optimized_pi.max()))
-
+    pi_vmin = min(float(baseline_pi.min()), float(target.min()), float(full_pi.min()), float(empirical_pi.min()))
+    pi_vmax = max(float(baseline_pi.max()), float(target.max()), float(full_pi.max()), float(empirical_pi.max()))
+    lambda_abs = max(float(np.max(np.abs(lambda_c))), 1.0e-12)
     panels = [
-        ("(a) lambda_C = 0 stationary pi", baseline_pi, "viridis", pi_vmin, pi_vmax),
-        ("(b) Uniform target rho", target, "viridis", pi_vmin, pi_vmax),
-        ("(c) Optimized stationary pi", optimized_pi, "viridis", pi_vmin, pi_vmax),
-        ("(d) Optimized lambda_C map", lambda_c, "coolwarm", None, None),
-        ("(e) Empirical optimized visits", empirical_pi, "viridis", pi_vmin, pi_vmax),
-        ("(f) Empirical |π̂_k - π|", np.abs(empirical_pi - target), "Reds", None, None),
+        ("(a) lambda_C = 0 stationary π", baseline_pi, "viridis", pi_vmin, pi_vmax),
+        ("(b) uniform target π̄", target, "viridis", pi_vmin, pi_vmax),
+        ("(c) optimized stationary π", full_pi, "viridis", pi_vmin, pi_vmax),
+        ("(d) optimized lambda_C map", lambda_c, "coolwarm", -lambda_abs, lambda_abs),
+        ("(e) empirical optimized visits", empirical_pi, "viridis", pi_vmin, pi_vmax),
+        ("(f) empirical absolute error", np.abs(empirical_pi - target), "Reds", None, None),
     ]
-
     for ax, (title, values, cmap, vmin, vmax) in zip(axes.flat, panels):
         im = ax.imshow(values.reshape(world.Ny, world.Nx), origin="lower", cmap=cmap, vmin=vmin, vmax=vmax)
         ax.set_title(title)
         ax.set_xlabel("col")
         ax.set_ylabel("row")
         fig.colorbar(im, ax=ax, fraction=0.046)
-
-    fig.suptitle("Inverse MaxCal coverage: fitted multipliers for uniform stationary coverage")
+    fig.suptitle("Inverse MaxCal coverage: multipliers for uniform stationary coverage")
     fig.tight_layout()
     fig.savefig(outdir / "maxcal_coverage_uniform_target_maps.png", dpi=150)
     plt.close(fig)
@@ -392,28 +291,28 @@ def make_degree_figure(
     degrees: np.ndarray,
     baseline_pi: np.ndarray,
     target: np.ndarray,
-    optimized_pi: np.ndarray,
+    full_pi: np.ndarray,
     empirical_pi: np.ndarray,
     lambda_c: np.ndarray,
     tied_pi: np.ndarray,
 ) -> None:
-    degree_values = sorted(int(d) for d in np.unique(degrees))
-    labels = [f"deg {degree}" for degree in degree_values]
+    degree_values = np.array(sorted(np.unique(degrees)), dtype=np.int64)
+    labels = [f"deg {int(degree)}" for degree in degree_values]
     x = np.arange(len(degree_values))
     width = 0.16
 
     def class_means(values: np.ndarray) -> np.ndarray:
-        return np.array([float(np.mean(values[degrees == degree])) for degree in degree_values])
+        return np.array([float(np.mean(values[degrees == degree])) for degree in degree_values], dtype=np.float64)
 
     fig, axes = plt.subplots(1, 2, figsize=(13.5, 4.8))
     axes[0].bar(x - 2 * width, class_means(baseline_pi), width=width, label="lambda=0 theory")
     axes[0].bar(x - width, class_means(target), width=width, label="uniform target")
-    axes[0].bar(x, class_means(optimized_pi), width=width, label="full lambda theory")
+    axes[0].bar(x, class_means(full_pi), width=width, label="full lambda theory")
     axes[0].bar(x + width, class_means(empirical_pi), width=width, label="full lambda empirical")
-    axes[0].bar(x + 2 * width, class_means(tied_pi), width=width, label="degree-tied optimum")
+    axes[0].bar(x + 2 * width, class_means(tied_pi), width=width, label="degree-tied theory")
     axes[0].set_xticks(x, labels=labels)
-    axes[0].set_ylabel("mean stationary/empirical probability per cell")
-    axes[0].set_title("Coverage probability by degree class")
+    axes[0].set_ylabel("mean probability per cell")
+    axes[0].set_title("coverage probability by degree class")
     axes[0].legend(fontsize=8)
 
     lambda_means = class_means(lambda_c)
@@ -424,272 +323,61 @@ def make_degree_figure(
     axes[1].axhline(0.0, color="black", lw=1.0)
     axes[1].set_xticks(x, labels=labels)
     axes[1].set_ylabel("lambda_C, gauge mean zero")
-    axes[1].set_title("Optimized multiplier pattern")
+    axes[1].set_title("optimized multiplier by degree")
 
     fig.tight_layout()
     fig.savefig(outdir / "maxcal_coverage_uniform_target_degree_classes.png", dpi=150)
     plt.close(fig)
 
 
-def make_case_comparison_figure(
-    outdir: Path,
-    world: mc.World,
-    cases: List[Dict[str, object]],
-    target: np.ndarray,
-) -> None:
+def make_case_comparison_figure(outdir: Path, world: mc.World, cases: list[dict[str, Any]], target: np.ndarray) -> None:
     fig, axes = plt.subplots(len(cases), 3, figsize=(12.8, 10.6))
-    lambda_abs = max(float(np.max(np.abs(case["lambda_c"]))) for case in cases)
-    lambda_abs = max(lambda_abs, 1e-12)
-    pi_vmin = min(
-        float(target.min()),
-        *(float(np.min(case["theory_pi"])) for case in cases),
-        *(float(np.min(case["empirical_pi"])) for case in cases),
-    )
-    pi_vmax = max(
-        float(target.max()),
-        *(float(np.max(case["theory_pi"])) for case in cases),
-        *(float(np.max(case["empirical_pi"])) for case in cases),
-    )
-
+    lambda_abs = max(max(float(np.max(np.abs(case["lambda_C"]))) for case in cases), 1.0e-12)
+    pi_vmin = min(float(target.min()), *(float(np.min(case["theory_pi"])) for case in cases))
+    pi_vmax = max(float(target.max()), *(float(np.max(case["theory_pi"])) for case in cases))
     for row, case in enumerate(cases):
-        lambda_c = np.asarray(case["lambda_c"], dtype=np.float64)
-        theory_pi = np.asarray(case["theory_pi"], dtype=np.float64)
-        empirical_pi = np.asarray(case["empirical_pi"], dtype=np.float64)
-        label = str(case["label"])
-
-        im0 = axes[row, 0].imshow(
-            lambda_c.reshape(world.Ny, world.Nx),
-            origin="lower",
-            cmap="coolwarm",
-            vmin=-lambda_abs,
-            vmax=lambda_abs,
-        )
-        axes[row, 0].set_title(f"{label}: lambda_C")
-        axes[row, 0].set_xlabel("col")
-        axes[row, 0].set_ylabel("row")
-        fig.colorbar(im0, ax=axes[row, 0], fraction=0.046)
-
-        im1 = axes[row, 1].imshow(
-            theory_pi.reshape(world.Ny, world.Nx),
-            origin="lower",
-            cmap="viridis",
-            vmin=pi_vmin,
-            vmax=pi_vmax,
-        )
-        axes[row, 1].set_title("theoretical stationary pi")
-        axes[row, 1].set_xlabel("col")
-        axes[row, 1].set_ylabel("row")
-        fig.colorbar(im1, ax=axes[row, 1], fraction=0.046)
-
-        im2 = axes[row, 2].imshow(
-            empirical_pi.reshape(world.Ny, world.Nx),
-            origin="lower",
-            cmap="viridis",
-            vmin=pi_vmin,
-            vmax=pi_vmax,
-        )
-        axes[row, 2].set_title("empirical visits")
-        axes[row, 2].set_xlabel("col")
-        axes[row, 2].set_ylabel("row")
-        fig.colorbar(im2, ax=axes[row, 2], fraction=0.046)
-
-    fig.suptitle("Coverage behavior under different MaxCal coverage multipliers")
+        result: mc.SimResult = case["result"]
+        panels = [
+            ("lambda_C", np.asarray(case["lambda_C"]), "coolwarm", -lambda_abs, lambda_abs),
+            ("theoretical stationary π̄", np.asarray(case["theory_pi"]), "viridis", pi_vmin, pi_vmax),
+            ("empirical visits", result.pi_empirical, "viridis", pi_vmin, pi_vmax),
+        ]
+        for col, (title, values, cmap, vmin, vmax) in enumerate(panels):
+            im = axes[row, col].imshow(values.reshape(world.Ny, world.Nx), origin="lower", cmap=cmap, vmin=vmin, vmax=vmax)
+            axes[row, col].set_title(f"{case['label']}: {title}" if col == 0 else title)
+            axes[row, col].set_xlabel("col")
+            axes[row, col].set_ylabel("row")
+            fig.colorbar(im, ax=axes[row, col], fraction=0.046)
+    fig.suptitle("Coverage behavior under different MaxCal multipliers")
     fig.tight_layout()
     fig.savefig(outdir / "maxcal_coverage_uniform_target_cases.png", dpi=150)
     plt.close(fig)
 
 
-def make_degree_time_figure(
-    outdir: Path,
-    degrees: np.ndarray,
-    target: np.ndarray,
-    cases: List[Dict[str, object]],
-) -> None:
-    degree_values = sorted(int(d) for d in np.unique(degrees))
+def make_degree_trace_figure(outdir: Path, degrees: np.ndarray, target: np.ndarray, cases: list[dict[str, Any]]) -> None:
+    degree_values = np.array(sorted(np.unique(degrees)), dtype=np.int64)
     colors = {3: "firebrick", 5: "darkorange", 8: "seagreen"}
     fig, axes = plt.subplots(1, len(cases), figsize=(15.0, 4.4), sharey=True)
-
+    if len(cases) == 1:
+        axes = np.array([axes])
     for ax, case in zip(axes, cases):
-        sim_result: mc.SimResult = case["sim_result"]  # type: ignore[assignment]
-        ck_history = np.array(sim_result.ck_history, dtype=np.float64)
-        markov_steps = np.array(sim_result.markov_step_history, dtype=np.int64)
-        for degree in degree_values:
-            mask = degrees == degree
-            class_trace = ck_history[:, mask].mean(axis=1)
-            ax.plot(markov_steps, class_trace, lw=2.0, color=colors[degree], label=f"degree {degree}")
+        result: mc.SimResult = case["result"]
+        ck_history = np.asarray(result.ck_history, dtype=np.float64)
+        markov_steps = np.asarray(result.markov_step_history, dtype=np.int64)
+        if len(ck_history):
+            for degree in degree_values:
+                mask = degrees == degree
+                ax.plot(markov_steps, ck_history[:, mask].mean(axis=1), lw=2.0, color=colors[int(degree)], label=f"degree {int(degree)}")
         ax.axhline(float(target[0]), color="black", ls="--", lw=1.1, label="uniform target")
         ax.set_title(str(case["label"]))
-        ax.set_xlabel("Markov steps")
+        ax.set_xlabel("Markov arrivals")
         ax.grid(alpha=0.25)
-
     axes[0].set_ylabel("mean visit probability per cell")
     axes[-1].legend(loc="upper right", fontsize=8)
-    fig.suptitle("Corner, edge, and interior coverage under different lambda_C choices")
+    fig.suptitle("Corner, edge, and interior convergence under different lambda_C choices")
     fig.tight_layout()
     fig.savefig(outdir / "maxcal_coverage_uniform_target_degree_traces.png", dpi=150)
     plt.close(fig)
-
-
-def save_raw_data(
-    outdir: Path,
-    target: np.ndarray,
-    baseline_pi: np.ndarray,
-    optimized_pi: np.ndarray,
-    empirical_pi: np.ndarray,
-    lambda_c: np.ndarray,
-    tied_lambda: np.ndarray,
-    tied_pi: np.ndarray,
-    error_history: np.ndarray,
-    case_results: List[Dict[str, object]],
-) -> None:
-    case_arrays: Dict[str, np.ndarray] = {}
-    for case in case_results:
-        key = f"case_{case['key']}"
-        sim_result: mc.SimResult = case["sim_result"]  # type: ignore[assignment]
-        case_arrays[f"{key}_lambda_C"] = np.asarray(case["lambda_c"], dtype=np.float64)
-        case_arrays[f"{key}_theory_pi"] = np.asarray(case["theory_pi"], dtype=np.float64)
-        case_arrays[f"{key}_empirical_pi"] = np.asarray(case["empirical_pi"], dtype=np.float64)
-        case_arrays[f"{key}_markov_steps"] = np.array(sim_result.markov_step_history, dtype=np.int64)
-        case_arrays[f"{key}_ck_history"] = np.array(sim_result.ck_history, dtype=np.float64)
-
-    np.savez(
-        outdir / "maxcal_coverage_uniform_target_raw_data.npz",
-        target_pi=target,
-        baseline_lambda_zero_pi=baseline_pi,
-        optimized_theory_pi=optimized_pi,
-        optimized_lambda_C=lambda_c,
-        degree_tied_lambda_C=tied_lambda,
-        degree_tied_pi=tied_pi,
-        solver_error_history=error_history,
-        **case_arrays,
-    )
-
-
-def serialise_stats(stats: Dict[str, DegreeClassStats]) -> Dict[str, Dict[str, float | int]]:
-    return {key: asdict(value) for key, value in stats.items()}
-
-
-def save_summary(
-    outdir: Path,
-    args: argparse.Namespace,
-    world: mc.World,
-    solver: SolverResult,
-    transition_checks_payload: Dict[str, float],
-    baseline_pi: np.ndarray,
-    target: np.ndarray,
-    optimized_pi: np.ndarray,
-    power_pi: np.ndarray,
-    empirical_pi: np.ndarray,
-    lambda_c: np.ndarray,
-    tied_lambda: np.ndarray,
-    tied_pi: np.ndarray,
-    tied_fit: DegreeTiedFit,
-    case_results: List[Dict[str, object]],
-) -> None:
-    degrees = degree_array(world)
-    optimized_case = next(case for case in case_results if case["key"] == "full")
-    optimized_empirical_pi = np.asarray(optimized_case["empirical_pi"], dtype=np.float64)
-    optimized_sim_result: mc.SimResult = optimized_case["sim_result"]  # type: ignore[assignment]
-    reps = representative_cells(world, target, baseline_pi, optimized_pi, optimized_empirical_pi, lambda_c)
-
-    case_payload = []
-    for case in case_results:
-        case_lambda = np.asarray(case["lambda_c"], dtype=np.float64)
-        case_theory = np.asarray(case["theory_pi"], dtype=np.float64)
-        case_empirical = np.asarray(case["empirical_pi"], dtype=np.float64)
-        case_sim: mc.SimResult = case["sim_result"]  # type: ignore[assignment]
-        case_payload.append(
-            {
-                "key": str(case["key"]),
-                "label": str(case["label"]),
-                "theory_l1_error_to_uniform_target": float(np.sum(np.abs(case_theory - target))),
-                "theory_max_abs_error_to_uniform_target": float(np.max(np.abs(case_theory - target))),
-                "empirical_l1_error_to_uniform_target": float(np.sum(np.abs(case_empirical - target))),
-                "empirical_max_abs_error_to_uniform_target": float(np.max(np.abs(case_empirical - target))),
-                "total_markov_steps": int(case_sim.markov_step_history[-1]),
-                "lambda_C_by_degree": serialise_stats(stats_by_degree(case_lambda, degrees)),
-                "theory_stationary_by_degree": serialise_stats(stats_by_degree(case_theory, degrees)),
-                "empirical_stationary_by_degree": serialise_stats(stats_by_degree(case_empirical, degrees)),
-            }
-        )
-
-    summary = {
-        "config": {
-            "Nx": mc.NX,
-            "Ny": mc.NY,
-            "K": world.K,
-            "cell_size_m": mc.CELL_SIZE,
-            "robots": mc.N_ROBOTS,
-            "simulation_steps": args.T,
-            "speed_m_per_step": args.speed,
-            "seed": args.seed,
-            "target": "uniform coverage, rho_k = 1 / K",
-            "lambda_gauge": "mean(lambda_C) = 0; adding a constant does not change P",
-        },
-        "theory": {
-            "kernel": "P_ij = A_ij exp(-lambda_j) / sum_l A_il exp(-lambda_l)",
-            "stationary_formula": "π_i = b_i (A b)_i / sum_m b_m (A b)_m, b_i = exp(-lambda_i)",
-            "inverse_condition": "For uniform π, solve b_i (A b)_i = constant for every cell.",
-            "interpretation": (
-                "Lower lambda_C means larger exp(-lambda_C), so the cell is made more attractive. "
-                "Boundary cells need lower lambda_C to compensate for fewer neighbors."
-            ),
-        },
-        "baseline_lambda_zero": {
-            "l1_error_to_uniform_target": float(np.sum(np.abs(baseline_pi - target))),
-            "max_abs_error_to_uniform_target": float(np.max(np.abs(baseline_pi - target))),
-            "stationary_by_degree": serialise_stats(stats_by_degree(baseline_pi, degrees)),
-        },
-        "optimized_full_per_cell_lambda": {
-            "solver": asdict(solver),
-            "transition_checks": transition_checks_payload,
-            "power_iteration_l1_error_to_target": float(np.sum(np.abs(power_pi - target))),
-            "power_iteration_max_abs_error_to_target": float(np.max(np.abs(power_pi - target))),
-            "lambda_C_by_degree": serialise_stats(stats_by_degree(lambda_c, degrees)),
-            "exp_minus_lambda_by_degree": serialise_stats(stats_by_degree(np.exp(-lambda_c), degrees)),
-            "stationary_by_degree": serialise_stats(stats_by_degree(optimized_pi, degrees)),
-            "representative_cells": {label: asdict(rep) for label, rep in reps.items()},
-        },
-        "degree_tied_optimized_lambda": {
-            "note": (
-                "This is the best three-class corner/edge/interior fit found by coordinate-pattern "
-                "search. It explains the multiplier ordering, but it is not exact because cells with "
-                "the same degree can still have different neighbor compositions."
-            ),
-            "fit": asdict(tied_fit),
-            "lambda_C_by_degree": serialise_stats(stats_by_degree(tied_lambda, degrees)),
-            "stationary_by_degree": serialise_stats(stats_by_degree(tied_pi, degrees)),
-            "l1_error_to_uniform_target": float(np.sum(np.abs(tied_pi - target))),
-            "max_abs_error_to_uniform_target": float(np.max(np.abs(tied_pi - target))),
-        },
-        "case_comparison": {
-            "note": (
-                "These cases make the effect of different lambda_C choices visible: zero multipliers "
-                "recover the degree-biased random walk; degree-tied multipliers partially compensate "
-                "corners and edges; full per-cell multipliers solve the uniform stationary target."
-            ),
-            "cases": case_payload,
-        },
-        "empirical_optimized_simulation": {
-            "total_markov_steps": int(optimized_sim_result.markov_step_history[-1]),
-            "l1_error_to_uniform_target": float(np.sum(np.abs(optimized_empirical_pi - target))),
-            "max_abs_error_to_uniform_target": float(np.max(np.abs(optimized_empirical_pi - target))),
-            "stationary_by_degree": serialise_stats(stats_by_degree(optimized_empirical_pi, degrees)),
-        },
-    }
-
-    summary["uniform_coverage_inverse_maxcal_validated"] = bool(
-        solver.converged
-        and solver.max_abs_stationary_error < args.tol * 10.0
-        and transition_checks_payload["max_row_sum_error"] < 1e-12
-        and transition_checks_payload["max_off_neighbor_probability"] < 1e-12
-        and summary["optimized_full_per_cell_lambda"]["power_iteration_max_abs_error_to_target"] < 1e-10
-        and summary["baseline_lambda_zero"]["l1_error_to_uniform_target"]
-        > summary["optimized_full_per_cell_lambda"]["solver"]["l1_stationary_error"]
-    )
-
-    with open(outdir / "maxcal_coverage_uniform_target_summary.json", "w", encoding="utf-8") as handle:
-        json.dump(summary, handle, indent=2)
 
 
 def main() -> None:
@@ -698,114 +386,145 @@ def main() -> None:
     outdir.mkdir(parents=True, exist_ok=True)
 
     world = mc.build_world(mc.NX, mc.NY, mc.CELL_SIZE)
-    adjacency = adjacency_matrix(world)
     target = mc.uniform_stationary(world)
     baseline_pi = mc.theoretical_stationary(world)
 
-    inverse_solution = mc.solve_coverage_multipliers_for_target(
-        w=world,
-        target_pi=target,
-        tol=args.tol,
-        max_iters=args.max_iters,
-    )
-    lambda_c = inverse_solution.lambda_C
-    optimized_pi = inverse_solution.stationary
-    solver = SolverResult(
-        iterations=inverse_solution.iterations,
-        max_abs_stationary_error=inverse_solution.max_abs_stationary_error,
-        l1_stationary_error=inverse_solution.l1_stationary_error,
-        converged=inverse_solution.converged,
-    )
-    error_history = inverse_solution.error_history
-    optimized_transition = mc.build_transition_matrix(world, lambda_c)
-    checks = transition_checks(world, optimized_transition)
-    power_pi = power_stationary(optimized_transition)
-
-    degrees = degree_array(world)
-    tied_lambda, tied_pi, tied_fit = optimise_degree_tied_multipliers(
-        adjacency=adjacency,
-        target=target,
-        degrees=degrees,
-        initial_lambda_c=lambda_c,
-    )
-    baseline_lambda = np.zeros(world.K, dtype=np.float64)
+    solution = mc.solve_coverage_multipliers_for_target(world, target, tol=args.tol, max_iters=args.max_iters)
+    full_pi = solution.stationary
+    full_transition = mc.build_transition_matrix(world, solution.lambda_C)
+    degree_tied_lambda, degree_tied_pi, degree_fit = optimize_degree_tied_multipliers(world, target, solution.lambda_C)
     case_specs = [
-        ("zero", "lambda_C = 0", baseline_lambda, baseline_pi),
-        ("degree_tied", "degree-tied lambda_C", tied_lambda, tied_pi),
-        ("full", "full per-cell lambda_C", lambda_c, optimized_pi),
+        ("zero", "lambda_C = 0", np.zeros(world.K, dtype=np.float64), baseline_pi),
+        ("degree_tied", "degree-tied lambda_C", degree_tied_lambda, degree_tied_pi),
+        ("full", "full per-cell lambda_C", solution.lambda_C, full_pi),
     ]
-    case_results: List[Dict[str, object]] = []
-    for offset, (key, label, case_lambda, case_theory) in enumerate(case_specs):
-        sim_result = run_simulation_with_lambda(
-            lambda_c=case_lambda,
-            speed=args.speed,
-            T=args.T,
-            seed=args.seed + offset,
-            target=target,
-        )
-        case_results.append(
+    cases: list[dict[str, Any]] = []
+    for offset, (key, label, lambda_c, theory_pi) in enumerate(case_specs):
+        result = run_with_lambda(lambda_c, target, args.speed, args.T, args.seed + offset)
+        cases.append(
             {
                 "key": key,
                 "label": label,
-                "lambda_c": case_lambda,
-                "theory_pi": case_theory,
-                "empirical_pi": sim_result.pi_empirical,
-                "sim_result": sim_result,
+                "lambda_C": lambda_c,
+                "theory_pi": theory_pi,
+                "result": result,
             }
         )
-    full_empirical_pi = np.asarray(case_results[-1]["empirical_pi"], dtype=np.float64)
 
-    make_maps_figure(outdir, world, baseline_pi, target, optimized_pi, lambda_c, full_empirical_pi)
-    make_degree_figure(outdir, degrees, baseline_pi, target, optimized_pi, full_empirical_pi, lambda_c, tied_pi)
-    make_case_comparison_figure(outdir, world, case_results, target)
-    make_degree_time_figure(outdir, degrees, target, case_results)
-    save_raw_data(
-        outdir=outdir,
-        target=target,
-        baseline_pi=baseline_pi,
-        optimized_pi=optimized_pi,
-        empirical_pi=full_empirical_pi,
-        lambda_c=lambda_c,
-        tied_lambda=tied_lambda,
-        tied_pi=tied_pi,
-        error_history=error_history,
-        case_results=case_results,
-    )
-    save_summary(
-        outdir=outdir,
-        args=args,
-        world=world,
-        solver=solver,
-        transition_checks_payload=checks,
-        baseline_pi=baseline_pi,
-        target=target,
-        optimized_pi=optimized_pi,
-        power_pi=power_pi,
-        empirical_pi=full_empirical_pi,
-        lambda_c=lambda_c,
-        tied_lambda=tied_lambda,
-        tied_pi=tied_pi,
-        tied_fit=tied_fit,
-        case_results=case_results,
-    )
+    full_case = next(case for case in cases if case["key"] == "full")
+    empirical: mc.SimResult = full_case["result"]
+    empirical_l1 = core.l1_error(empirical.pi_empirical, target)
 
-    lambda_stats = stats_by_degree(lambda_c, degrees)
-    print("Inverse MaxCal Coverage Validation: Uniform Target")
-    print(f"  Output directory       : {outdir}")
-    print(f"  Solver converged       : {solver.converged} in {solver.iterations} iterations")
-    print(f"  Theory max abs error   : {solver.max_abs_stationary_error:.3e}")
-    print(f"  lambda=0 L1 vs uniform : {np.sum(np.abs(baseline_pi - target)):.6f}")
-    print(f"  optimized L1 vs uniform: {solver.l1_stationary_error:.3e}")
-    print(f"  degree-tied L1 vs uniform: {tied_fit.l1_stationary_error:.6f}")
-    print(f"  empirical L1 vs uniform: {np.sum(np.abs(full_empirical_pi - target)):.6f}")
-    print("  Mean lambda_C by degree:")
-    for degree in sorted(lambda_stats, key=int):
-        stat = lambda_stats[degree]
-        print(
-            f"    degree {degree}: mean={stat.mean:+.6f}, "
-            f"min={stat.minimum:+.6f}, max={stat.maximum:+.6f}"
+    degrees = degree_array(world)
+    payload = {
+        "target": target,
+        "baseline_pi": baseline_pi,
+        "degree_tied_pi": degree_tied_pi,
+        "degree_tied_lambda_C": degree_tied_lambda,
+        "full_pi": full_pi,
+        "empirical_pi": empirical.pi_empirical,
+        "lambda_C": solution.lambda_C,
+        "solution": solution,
+        "cases": cases,
+    }
+    save_raw_data(outdir, payload)
+    make_maps_figure(outdir, world, baseline_pi, target, full_pi, solution.lambda_C, empirical.pi_empirical)
+    make_degree_figure(outdir, degrees, baseline_pi, target, full_pi, empirical.pi_empirical, solution.lambda_C, degree_tied_pi)
+    make_case_comparison_figure(outdir, world, cases, target)
+    make_degree_trace_figure(outdir, degrees, target, cases)
+
+    case_summary = []
+    for case in cases:
+        result: mc.SimResult = case["result"]
+        theory_pi = np.asarray(case["theory_pi"], dtype=np.float64)
+        case_summary.append(
+            {
+                "key": str(case["key"]),
+                "label": str(case["label"]),
+                "theory_l1_error": core.l1_error(theory_pi, target),
+                "theory_max_abs_error": float(np.max(np.abs(theory_pi - target))),
+                "empirical_l1_error": core.l1_error(result.pi_empirical, target),
+                "empirical_max_abs_error": float(np.max(np.abs(result.pi_empirical - target))),
+                "total_markov_arrivals": int(result.markov_step_history[-1]) if result.markov_step_history else 0,
+                "lambda_by_degree": stats_by_degree(np.asarray(case["lambda_C"], dtype=np.float64), degrees),
+                "theory_by_degree": stats_by_degree(theory_pi, degrees),
+                "empirical_by_degree": stats_by_degree(result.pi_empirical, degrees),
+            }
         )
-    print("  Saved summary          : maxcal_coverage_uniform_target_summary.json")
+
+    checks = {
+        "zero_multiplier_is_not_uniform_on_irregular_grid": bool(core.l1_error(baseline_pi, target) > 1.0e-3),
+        "full_inverse_solver_converged": bool(solution.converged),
+        "full_inverse_stationary_matches_uniform": bool(solution.l1_stationary_error < 1.0e-8),
+        "degree_tied_is_only_a_partial_fit": bool(degree_fit.l1_stationary_error > 10.0 * solution.l1_stationary_error),
+        "empirical_run_completed": bool(empirical.markov_step_history),
+    }
+    summary = {
+        "paper_alignment": {
+            "layer": "Inverse Layer 1-C coverage",
+            "claim": "For a requested coverage density rho, inverse MaxCal chooses destination multipliers so the reversible stationary law pi(lambda_C) matches rho.",
+            "validated_outputs": [
+                "lambda=0 degree-biased baseline",
+                "full per-cell inverse multiplier field",
+                "uniform-target stationary residual",
+                "finite-run empirical visit histogram",
+            ],
+        },
+        "environment": {
+            "Nx": mc.NX,
+            "Ny": mc.NY,
+            "K": world.K,
+            "cell_size": mc.CELL_SIZE,
+            "robots": mc.N_ROBOTS,
+            "T": args.T,
+            "speed": args.speed,
+        },
+        "zero_multiplier": {
+            "l1_stationary_error": core.l1_error(baseline_pi, target),
+            "max_abs_stationary_error": float(np.max(np.abs(baseline_pi - target))),
+        },
+        "degree_tied": asdict(degree_fit),
+        "full_per_cell": {
+            "iterations": solution.iterations,
+            "converged": solution.converged,
+            "l1_stationary_error": solution.l1_stationary_error,
+            "max_abs_stationary_error": solution.max_abs_stationary_error,
+            "transition_checks": transition_checks(world, full_transition),
+        },
+        "empirical": {
+            "total_markov_arrivals": int(empirical.markov_step_history[-1]) if empirical.markov_step_history else 0,
+            "l1_error": empirical_l1,
+            "max_abs_error": float(np.max(np.abs(empirical.pi_empirical - target))),
+        },
+        "lambda_by_degree": stats_by_degree(solution.lambda_C, degrees),
+        "stationary_by_degree": stats_by_degree(full_pi, degrees),
+        "representative_cells": representative_cells(
+            world, target, baseline_pi, degree_tied_pi, full_pi, empirical.pi_empirical, solution.lambda_C
+        ),
+        "case_comparison": {
+            "note": "zero multipliers recover degree-biased coverage; degree-tied multipliers partially compensate; full per-cell multipliers solve the uniform target.",
+            "cases": case_summary,
+        },
+        "checks": checks,
+        "inverse_coverage_ready": bool(all(checks.values())),
+        "figures": FIGURES,
+    }
+    with open(outdir / "maxcal_coverage_uniform_target_summary.json", "w", encoding="utf-8") as handle:
+        json.dump(json_safe(summary), handle, indent=2)
+
+    print("Inverse MaxCal Coverage Validation: Uniform Target")
+    print(f"  Output directory        : {outdir}")
+    print(f"  Validation ready        : {summary['inverse_coverage_ready']}")
+    print(f"  Solver converged        : {solution.converged} in {solution.iterations} iterations")
+    print(f"  Theory max abs error    : {solution.max_abs_stationary_error:.3e}")
+    print(f"  lambda=0 L1 vs uniform  : {summary['zero_multiplier']['l1_stationary_error']:.6f}")
+    print(f"  optimized L1 vs uniform : {solution.l1_stationary_error:.3e}")
+    print(f"  degree-tied L1 vs uniform: {degree_fit.l1_stationary_error:.6f}")
+    print(f"  empirical L1 vs uniform : {empirical_l1:.6f}")
+    print("  Mean lambda_C by degree :")
+    for degree, stat in stats_by_degree(solution.lambda_C, degrees).items():
+        print(f"    degree {degree}: mean={stat['mean']:+.6f}, min={stat['min']:+.6f}, max={stat['max']:+.6f}")
+    print("  Saved summary           : maxcal_coverage_uniform_target_summary.json")
 
 
 if __name__ == "__main__":
