@@ -1,9 +1,24 @@
-"""
-Per-robot world maps for local coverage-age observables and map-record freshness.
+"""RBE 511 Swarm Intelligence Final Project - MaxCal-Derived Swarm Control: Emergent Oscillation Between Coverage and Information Diffusion
 
-The coverage-age observable is cell indexed: it measures how long it
-has been since each region was physically visited, while the other observable Age of
-Information is the time since robot-robot information exchanged.
+Author: Filippo Marcantoni (fmarcantoni@wpi.edu), Pau Alcolea (palcolea@wpi.edu), Chris Walczak (cwalczak2@wpi.edu)
+Course: RBE 511 - Swarm Intelligence (Prof. Carlo Pinciroli)
+Institution: Worcester Polytechnic Institute  
+
+-------------------------------------------------------------------------------------------------------------------------------------------
+
+Per-robot world maps for local coverage-age observables and map freshness.
+
+This module stores per-robot local map records used to measure local coverage
+freshness.  That is deliberately separate from the paper-level AoI ``tau_i``,
+which is updated by robot-robot information exchange events.
+
+For robot ``i`` and cell ``k`` the local quantities are
+
+    kappa_i^k(t) = t - T_i^k,  coverage age from the known visit time;
+    eta_i^k(t)   = t - R_i^k,  age of the stored map record itself.
+
+Pinciroli's AoI is instead ``tau_i(t)=t-last_meet_i`` and lives on the robot,
+not on individual cells.
 """
 
 from __future__ import annotations
@@ -44,7 +59,7 @@ class RobotWorldMap:
         )
 
     def observe_cell(self, cell: int, t: float) -> None:
-        """Record a direct physical visit by the robot."""
+        """Record a direct physical visit: ``T_i^k=R_i^k=t``."""
         self.last_visit_time[cell] = max(float(t), float(self.last_visit_time[cell]))
         self.last_map_record_time[cell] = float(t)
 
@@ -74,7 +89,7 @@ class RobotWorldMap:
         return int(np.count_nonzero(received_record))
 
     def coverage_age(self, t: float) -> np.ndarray:
-        """Return kappa_i^k(t), unknown cells being maximally stale."""
+        """Return ``kappa_i^k(t)=t-T_i^k``, with unknown cells maximally stale."""
         t_float = float(t)
         return np.where(
             self.last_visit_time >= 0.0,
@@ -83,7 +98,7 @@ class RobotWorldMap:
         )
 
     def map_record_age(self, t: float) -> np.ndarray:
-        """Return the cell-wise age of local map records."""
+        """Return ``eta_i^k(t)=t-R_i^k`` for cell-wise map-record freshness."""
         t_float = float(t)
         return np.where(
             self.last_map_record_time >= 0.0,

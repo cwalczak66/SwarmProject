@@ -1,36 +1,39 @@
 """
-Validation script for Information Diffusion Layer 1-I.
+RBE 511 Swarm Intelligence Final Project - MaxCal-Derived Swarm Control: Emergent Oscillation Between Coverage and Information Diffusion
 
-This validator is written around the Pinciroli sign prediction quoted by the
-user from the local draft:
+Author: Filippo Marcantoni (fmarcantoni@wpi.edu), Pau Alcolea (palcolea@wpi.edu), Chris Walczak (cwalczak2@wpi.edu)
+Course: RBE 511 - Swarm Intelligence (Prof. Carlo Pinciroli)
+Institution: Worcester Polytechnic Institute  
 
-    lambda_I < 0   -> robots cluster
-    lambda_I >= 0  -> robots prioritize coverage / avoid clustering
+-------------------------------------------------------------------------------------------------------------------------------------------
 
-The checks are therefore organized around that exact claim:
+Validate the Layer 1-I information-diffusion controller.
 
-1. Local kernel sign check:
-   for a fixed positive information field, negative lambda_I must increase the
-   probability of moving toward high-information neighbors, zero must recover
-   the coverage kernel, and positive lambda_I must do the opposite.
+The validator checks the theoretical and empirical behavior of the information
+diffusion layer.  The local kernel is
 
-2. Paper fixed-point sign sweep:
-   the information observable is π̄_k from Pinciroli's fixed-point equation,
-   and p_enc = sum_k π̄_k^2 is recorded as the theoretical encounter
-   probability used in the mean-field diffusion equation.
+    P_ij(pi_bar) proportional to
+        A_ij exp[-lambda_C,j - lambda_I pi_bar_j].
 
-3. Stochastic information sharing:
-   robots encounter each other when they occupy the same region. Successful
-   communication is Bernoulli with probability beta, and successful exchange
-   resets the Age of Information tau_i, i.e. the time since that robot last exchanged information. 
-   This tests actual sharing, not only radius-based contact counting.
+The sign prediction is therefore:
 
-4. Inverse information-rate solve:
-   unlike coverage, which inverts a desired spatial distribution, Layer 1-I
-   inverts spreading-rate constraint dn/dt by finding the scalar
-   lambda_I whose fixed-point p_enc produces the requested rate. The inverse
-   solve follows a chosen fixed-point branch by continuation and refines the
-   multiplier by bisection when the target is bracketed.
+    lambda_I < 0  -> high-information destinations are cheaper, so robots cluster;
+    lambda_I >= 0 -> high-information destinations are neutral or costly, so
+                     coverage-like motion is preserved.
+
+The control field is self-consistent:
+
+    pi_bar = stationary(P(pi_bar)),
+
+and the same-cell encounter probability entering the mean-field diffusion law is
+
+    p_enc = sum_k pi_bar_k^2,
+    dn/dt = A beta p_enc f(1-f),  f=n/A.
+
+The inverse validation solves for the scalar ``lambda_I`` that matches a target
+``dn/dt`` or ``p_enc``.  If multiple fixed-point solutions match, the selected
+controller is the minimum-change solution closest to the neutral controller
+``lambda_I=0``.
 
 Usage:
     venv/bin/python maxcal_info_diffusion_validation.py
@@ -114,7 +117,7 @@ def parse_args() -> argparse.Namespace:
         "--sign-sweep-T",
         type=int,
         default=9_000,
-        help="Simulation length for the isolated sign sweep. Use 9000 for the report-scale run.",
+        help="Simulation length for the isolated sign sweep.",
     )
     parser.add_argument(
         "--stage2-preview-T",
@@ -126,7 +129,7 @@ def parse_args() -> argparse.Namespace:
         "--spread-T",
         type=int,
         default=6_000,
-        help="Simulation length for the informed-robot spread validation. Use 6000 for the report-scale run.",
+        help="Simulation length for the informed-robot spread validation.",
     )
     parser.add_argument(
         "--inverse-target-rate",
@@ -134,14 +137,13 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Target dn/dt for the inverse information-rate validation. If omitted, "
-            "--inverse-target-p-enc is converted to a rate using Pinciroli's "
-            "mean-field equation at one initially informed robot."
+            "--inverse-target-p-enc is converted to a rate with one initially informed robot."
         ),
     )
     parser.add_argument(
         "--inverse-target-p-enc",
         type=float,
-        default=0.50,
+        default=0.5,
         help="Encounter-probability target used to derive the inverse target rate when no rate is supplied.",
     )
     parser.add_argument(
@@ -162,6 +164,12 @@ def parse_args() -> argparse.Namespace:
         help="Lambda_I step size used to trace each fixed-point branch before local bisection.",
     )
     parser.add_argument(
+        "--inverse-reference-lambda-I",
+        type=float,
+        default=0.0,
+        help="Neutral multiplier used to break ties between inverse-rate solutions.",
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         default=mid.SEED,
@@ -179,6 +187,7 @@ def _robot_at_cell(robot_id: int, w: mid.World, k: int, age: float) -> mid.Robot
 
 
 def kernel_sign_checks() -> Dict[str, float | bool]:
+    """Check the local sign convention of the Layer 1-I kernel."""
     w = mid.build_world(mid.NX, mid.NY, mid.CELL_SIZE)
     lambda_c = mid.build_lambda_C(w, mid.LAMBDA_C_VAL)
     sample_k = (mid.NY // 2) * mid.NX + mid.NX // 2
@@ -231,6 +240,7 @@ def kernel_sign_checks() -> Dict[str, float | bool]:
 
 
 def information_field_checks() -> Dict[str, float | bool]:
+    """Check that the local information field peaks near a robot cluster."""
     w = mid.build_world(mid.NX, mid.NY, mid.CELL_SIZE)
     cluster_k = (mid.NY // 2) * mid.NX + mid.NX // 2
     robots = [_robot_at_cell(i, w, cluster_k, PURE_STALE_AGE) for i in range(15)]
@@ -256,6 +266,7 @@ def information_field_checks() -> Dict[str, float | bool]:
 
 
 def local_map_age_checks() -> Dict[str, float | bool]:
+    """Separate coverage-age records from map-record freshness records."""
     w = mid.build_world(mid.NX, mid.NY, mid.CELL_SIZE)
     first_cell = 0
     second_cell = w.K - 1
@@ -289,6 +300,7 @@ def local_map_age_checks() -> Dict[str, float | bool]:
 
 
 def information_exchange_checks() -> Dict[str, int | bool]:
+    """Check Bernoulli communication, AoI reset, and map exchange semantics."""
     w = mid.build_world(mid.NX, mid.NY, mid.CELL_SIZE)
     same_cell = (mid.NY // 2) * mid.NX + mid.NX // 2
     far_cell = 0
@@ -322,8 +334,8 @@ def information_exchange_checks() -> Dict[str, int | bool]:
         "second_received_first_map_record": bool(robots[1].world_map.last_visit_time[far_cell] == 2.0),
         "first_map_record_age_reset_for_received_record": bool(robots[0].world_map.map_record_age(7.0)[w.K - 1] == 0.0),
         "second_map_record_age_reset_for_received_record": bool(robots[1].world_map.map_record_age(7.0)[far_cell] == 0.0),
-        "first_paper_aoi_reset_after_exchange": bool(robots[0].info_age == 0.0),
-        "second_paper_aoi_reset_after_exchange": bool(robots[1].info_age == 0.0),
+        "first_aoi_reset_after_exchange": bool(robots[0].info_age == 0.0),
+        "second_aoi_reset_after_exchange": bool(robots[1].info_age == 0.0),
     }
 
 
@@ -367,6 +379,7 @@ def run_sign_case(T: int, lambda_I_value: float, seed: int) -> SignSweepPoint:
 
 
 def sign_sweep(T: int, seed: int) -> Dict[str, object]:
+    """Sweep ``lambda_I`` and record fixed-point plus simulation diagnostics."""
     points = [
         run_sign_case(T=T, lambda_I_value=value, seed=seed + i)
         for i, value in enumerate(SIGN_SWEEP_VALUES)
@@ -470,24 +483,10 @@ def stage2_preview(T: int, seed: int) -> Dict[str, object]:
         "positive_information_mode": pack(positive_mode),
         "negative_lambda_clusters_vs_zero": bool(negative_clusters_vs_zero),
         "positive_lambda_preserves_coverage_vs_zero": bool(positive_preserves_coverage_vs_zero),
-        "negative_lambda_reduces_paper_aoi_vs_positive": bool(negative_reduces_aoi_vs_positive),
-        "paper_aoi_is_time_since_robot_robot_exchange": True,
-        "local_maps_are_freshness_records_not_the_paper_aoi": True,
+        "negative_lambda_reduces_aoi_vs_positive": bool(negative_reduces_aoi_vs_positive),
+        "aoi_is_time_since_robot_robot_exchange": True,
+        "local_maps_are_freshness_records_not_aoi": True,
     }
-
-
-def _meeting_pairs(robots: Sequence[mid.Robot], r_meet: float) -> List[tuple[int, int, float, float]]:
-    pairs: List[tuple[int, int, float, float]] = []
-    xs = np.array([r.x for r in robots], dtype=np.float64)
-    ys = np.array([r.y for r in robots], dtype=np.float64)
-    for i in range(len(robots)):
-        dx = xs[i + 1:] - xs[i]
-        dy = ys[i + 1:] - ys[i]
-        hits = np.where(dx * dx + dy * dy <= r_meet * r_meet)[0]
-        for j_off in hits:
-            j = i + 1 + int(j_off)
-            pairs.append((i, j, 0.5 * (xs[i] + xs[j]), 0.5 * (ys[i] + ys[j])))
-    return pairs
 
 
 def _threshold_time(t_axis: Sequence[int], fractions: Sequence[float], threshold: float) -> int | None:
@@ -734,13 +733,17 @@ def inverse_information_rate_validation(
     target_p_enc: float,
     branch: str,
     continuation_step: float,
+    reference_lambda_I: float,
 ) -> Dict[str, object]:
     """
     Invert information-rate constraint to compute lambda_I.
 
     Coverage uses a target spatial distribution. Layer 1-I instead uses the
     mean-field spreading rate dn/dt = A beta p_enc f(1-f), where p_enc is
-    induced by the stationary distribution of the information kernel.
+    induced by the stationary distribution of the information kernel.  When
+    several fixed points match the same target, the solver selects the
+    multiplier closest to ``reference_lambda_I``; by default this is the
+    neutral initial controller ``lambda_I = 0``.
     """
     w = mid.build_world(mid.NX, mid.NY, mid.CELL_SIZE)
     lambda_c = mid.build_lambda_C(w, mid.LAMBDA_C_VAL)
@@ -770,6 +773,7 @@ def inverse_information_rate_validation(
         seed=seed,
         branch=branch,
         continuation_step=continuation_step,
+        reference_lambda_I=reference_lambda_I,
     )
 
     empirical_point, empirical_series = run_information_spread_case(
@@ -806,36 +810,40 @@ def make_sign_sweep_figure(outdir: Path, sweep: Dict[str, object]) -> None:
     values = np.array([point.lambda_I_value for point in points], dtype=np.float64)
     disp = np.array([point.mean_dispersion for point in points], dtype=np.float64)
     encounter = np.array([point.mean_encounter_proxy for point in points], dtype=np.float64)
+    p_enc = np.array([point.theoretical_p_enc for point in points], dtype=np.float64)
     coverage_l1 = np.array([point.final_coverage_l1 for point in points], dtype=np.float64)
-    arrivals = np.array([point.total_markov_arrivals for point in points], dtype=np.float64)
 
     fig, axes = plt.subplots(2, 2, figsize=(11.5, 8.0))
 
     axes[0, 0].plot(values, disp, marker="o", lw=2.0, color="navy")
     axes[0, 0].axvline(0.0, color="grey", ls=":")
-    axes[0, 0].set_title("Mean dispersion vs lambda_I")
-    axes[0, 0].set_xlabel("lambda_I")
-    axes[0, 0].set_ylabel("mean S(t)")
+    axes[0, 0].set_title("Mean spatial dispersion")
+    axes[0, 0].set_xlabel(r"$\lambda_I$")
+    axes[0, 0].set_ylabel(r"$\mathbb{E}[S(t)]$")
 
     axes[0, 1].plot(values, encounter, marker="o", lw=2.0, color="darkorange")
     axes[0, 1].axvline(0.0, color="grey", ls=":")
-    axes[0, 1].set_title("Encounter proxy vs lambda_I")
-    axes[0, 1].set_xlabel("lambda_I")
-    axes[0, 1].set_ylabel("mean sum_k occ_k^2")
+    axes[0, 1].set_title("Empirical encounter proxy")
+    axes[0, 1].set_xlabel(r"$\lambda_I$")
+    axes[0, 1].set_ylabel(r"$\mathbb{E}[\sum_k \hat{o}_k(t)^2]$")
 
-    axes[1, 0].plot(values, coverage_l1, marker="o", lw=2.0, color="slateblue")
+    axes[1, 0].plot(values, p_enc, marker="o", lw=2.0, color="crimson")
     axes[1, 0].axvline(0.0, color="grey", ls=":")
-    axes[1, 0].set_title("Final coverage error vs lambda_I")
-    axes[1, 0].set_xlabel("lambda_I")
-    axes[1, 0].set_ylabel("final ||c(.,t) - π̄(.)||_1")
+    axes[1, 0].set_title(r"Fixed-point encounter probability")
+    axes[1, 0].set_xlabel(r"$\lambda_I$")
+    axes[1, 0].set_ylabel(r"$p_{enc}=\sum_k \bar{\pi}_k^2$")
 
-    axes[1, 1].plot(values, arrivals, marker="o", lw=2.0, color="seagreen")
+    axes[1, 1].plot(values, coverage_l1, marker="o", lw=2.0, color="slateblue")
     axes[1, 1].axvline(0.0, color="grey", ls=":")
-    axes[1, 1].set_title("Total Markov arrivals vs lambda_I")
-    axes[1, 1].set_xlabel("lambda_I")
-    axes[1, 1].set_ylabel("total arrivals")
+    axes[1, 1].set_title("Final coverage mismatch")
+    axes[1, 1].set_xlabel(r"$\lambda_I$")
+    axes[1, 1].set_ylabel(r"$\|c(\cdot,T)-\bar{\pi}\|_1$")
 
-    fig.tight_layout()
+    for ax in axes.flat:
+        ax.grid(alpha=0.25)
+
+    fig.suptitle("Information multiplier sign sweep")
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.95))
     fig.savefig(outdir / "maxcal_info_diffusion_validation_sign_sweep.png", dpi=140)
     plt.close(fig)
 
@@ -857,9 +865,9 @@ def make_information_spread_figure(outdir: Path, spread: Dict[str, object]) -> N
             series[key]["informed_fraction"],
             lw=2.0,
             color=colors[point.lambda_I_value],
-            label=f"lambda_I={point.lambda_I_value:+.0f}",
+            label=rf"$\lambda_I={point.lambda_I_value:+.0f}$",
         )
-    axes[0, 0].set_title("Fraction of informed robots")
+    axes[0, 0].set_title("Information spread")
     axes[0, 0].set_xlabel("simulation step")
     axes[0, 0].set_ylabel("informed fraction")
     axes[0, 0].set_ylim(-0.02, 1.02)
@@ -872,11 +880,11 @@ def make_information_spread_figure(outdir: Path, spread: Dict[str, object]) -> N
             series[key]["mean_aoi"],
             lw=2.0,
             color=colors[point.lambda_I_value],
-            label=f"lambda_I={point.lambda_I_value:+.0f}",
+            label=rf"$\lambda_I={point.lambda_I_value:+.0f}$",
         )
-    axes[0, 1].set_title("Mean Age of Information tau")
+    axes[0, 1].set_title(r"Mean Age of Information")
     axes[0, 1].set_xlabel("simulation step")
-    axes[0, 1].set_ylabel("time since robot-robot exchange")
+    axes[0, 1].set_ylabel(r"mean $\tau$")
     axes[0, 1].legend(fontsize=8)
 
     for point in points:
@@ -886,7 +894,7 @@ def make_information_spread_figure(outdir: Path, spread: Dict[str, object]) -> N
             np.maximum(series[key]["cumulative_meetings"], 1),
             lw=2.0,
             color=colors[point.lambda_I_value],
-            label=f"lambda_I={point.lambda_I_value:+.0f}",
+            label=rf"$\lambda_I={point.lambda_I_value:+.0f}$",
         )
     axes[0, 2].set_title("Cumulative physical meetings")
     axes[0, 2].set_xlabel("simulation step")
@@ -901,7 +909,7 @@ def make_information_spread_figure(outdir: Path, spread: Dict[str, object]) -> N
     ]
     axes[1, 0].bar(labels, t90, color=[colors[point.lambda_I_value] for point in points])
     axes[1, 0].set_title("Time to 90% informed")
-    axes[1, 0].set_xlabel("lambda_I")
+    axes[1, 0].set_xlabel(r"$\lambda_I$")
     axes[1, 0].set_ylabel("simulation step")
 
     x = np.arange(len(points))
@@ -912,83 +920,204 @@ def make_information_spread_figure(outdir: Path, spread: Dict[str, object]) -> N
     axes[1, 1].bar(x + width / 2, transmission_cells, width=width, color="darkorange", label="transmission cells")
     axes[1, 1].set_xticks(x, labels=labels)
     axes[1, 1].set_title("Spatial spread of contacts")
-    axes[1, 1].set_xlabel("lambda_I")
+    axes[1, 1].set_xlabel(r"$\lambda_I$")
     axes[1, 1].set_ylabel("number of cells")
     axes[1, 1].legend(fontsize=8)
 
     final_cov_age = [point.final_mean_coverage_age for point in points]
     final_aoi = [point.final_mean_aoi for point in points]
     axes[1, 2].bar(x - width / 2, final_cov_age, width=width, color="seagreen", label="coverage age")
-    axes[1, 2].bar(x + width / 2, final_aoi, width=width, color="crimson", label="AoI tau")
+    axes[1, 2].bar(x + width / 2, final_aoi, width=width, color="crimson", label=r"AoI $\tau$")
     axes[1, 2].set_xticks(x, labels=labels)
-    axes[1, 2].set_title("Final local age observables")
-    axes[1, 2].set_xlabel("lambda_I")
+    axes[1, 2].set_title("Final age observables")
+    axes[1, 2].set_xlabel(r"$\lambda_I$")
     axes[1, 2].set_ylabel("mean age")
     axes[1, 2].legend(fontsize=8)
 
-    fig.suptitle("Information diffusion validation: informed fraction and meeting locations")
-    fig.tight_layout()
+    for ax in axes.flat:
+        ax.grid(alpha=0.20)
+
+    fig.suptitle("Information diffusion validation: spread, meetings, and age")
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.95))
     fig.savefig(outdir / "maxcal_info_diffusion_validation_spread.png", dpi=140)
     plt.close(fig)
 
 
 def make_inverse_rate_figure(outdir: Path, inverse: Dict[str, object]) -> None:
-    evaluations = inverse["evaluations"]
-    branch_evaluations = inverse.get("branch_evaluations", {})
+    """Plot the inverse-rate solve and the empirical consequences.
+
+    The inverse problem can contain several fixed-point branches at the same
+    ``lambda_I``.  For the two design panels, the shaded band shows the range
+    of fixed-point values found at each multiplier, while the solid line shows
+    the branch sample closest to the requested target.  This keeps the figure
+    readable and makes the selected minimum-change solution explicit.
+    """
     selected_lambda = float(inverse["lambda_I"])
     target_rate = float(inverse["target_information_spreading_rate"])
     selected_rate = float(inverse["predicted_information_spreading_rate"])
-    series: Dict[str, np.ndarray] = inverse["empirical_series"]
+    target_p_enc = float(inverse["target_p_enc"])
+    selected_p_enc = float(inverse["predicted_p_enc"])
     empirical_point: InformationSpreadPoint = inverse["empirical_spread_point"]
+    empirical_series: Dict[str, np.ndarray] = inverse["empirical_series"]
 
-    fig, axes = plt.subplots(1, 3, figsize=(15.0, 4.6))
+    fig, axes = plt.subplots(2, 2, figsize=(13.4, 8.2))
+    ax_rate, ax_enc, ax_age, ax_spread = axes.flat
 
     branch_styles = {
-        "clustered": ("crimson", "clustered branch"),
-        "coverage": ("seagreen", "coverage branch"),
-        "fallback_scan": ("slategray", "fallback scan"),
+        "clustered": ("crimson", "clustered fixed points"),
+        "coverage": ("seagreen", "coverage fixed points"),
     }
-    plotted_any = False
-    for branch_name, samples in branch_evaluations.items():
-        if not samples:
+
+    def branch_envelope(
+        samples: Sequence[Dict[str, object]],
+        metric: str,
+        target: float,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        grouped: Dict[float, List[float]] = {}
+        for sample in samples:
+            value = float(sample[metric])
+            if not np.isfinite(value):
+                continue
+            grouped.setdefault(float(sample["lambda_I"]), []).append(value)
+        lambdas = np.array(sorted(grouped), dtype=np.float64)
+        lower = np.array([min(grouped[value]) for value in lambdas], dtype=np.float64)
+        upper = np.array([max(grouped[value]) for value in lambdas], dtype=np.float64)
+        nearest = np.array(
+            [min(grouped[value], key=lambda metric_value: abs(metric_value - target)) for value in lambdas],
+            dtype=np.float64,
+        )
+        return lambdas, lower, upper, nearest
+
+    plotted_labels: set[str] = set()
+    all_lambdas: List[float] = []
+    for branch_name, samples in inverse.get("branch_evaluations", {}).items():
+        if branch_name == "fallback_scan" or not samples:
             continue
-        values = np.array([float(item["lambda_I"]) for item in samples], dtype=np.float64)
-        rates = np.array([float(item["information_spreading_rate"]) for item in samples], dtype=np.float64)
-        p_enc = np.array([float(item["p_enc"]) for item in samples], dtype=np.float64)
         color, label = branch_styles.get(branch_name, ("royalblue", branch_name))
-        axes[0].plot(values, rates, marker="o", lw=1.8, color=color, label=label)
-        axes[1].plot(values, p_enc, marker="o", lw=1.8, color=color, label=label)
-        plotted_any = True
-    if not plotted_any:
-        values = np.array([float(item["lambda_I"]) for item in evaluations], dtype=np.float64)
-        rates = np.array([float(item["information_spreading_rate"]) for item in evaluations], dtype=np.float64)
-        p_enc = np.array([float(item["p_enc"]) for item in evaluations], dtype=np.float64)
-        axes[0].plot(values, rates, marker="o", lw=1.8, color="crimson", label="evaluations")
-        axes[1].plot(values, p_enc, marker="o", lw=1.8, color="darkorange", label="evaluations")
-    axes[0].axhline(target_rate, color="black", ls=":", label="target dn/dt")
-    axes[0].scatter([selected_lambda], [selected_rate], s=70, color="gold", edgecolor="black", zorder=5)
-    axes[0].set_xlabel("lambda_I")
-    axes[0].set_ylabel("predicted dn/dt")
-    axes[0].set_title("Inverse information-rate solve")
-    axes[0].legend(fontsize=8)
+        lambdas, rate_min, rate_max, rate_nearest = branch_envelope(
+            samples, "information_spreading_rate", target_rate
+        )
+        _, p_min, p_max, p_nearest = branch_envelope(samples, "p_enc", target_p_enc)
+        if len(lambdas) == 0:
+            continue
+        all_lambdas.extend(lambdas.tolist())
+        branch_label = label if label not in plotted_labels else None
+        plotted_labels.add(label)
+        if np.any(rate_max > rate_min):
+            ax_rate.fill_between(lambdas, rate_min, rate_max, color=color, alpha=0.14, linewidth=0.0)
+        if np.any(p_max > p_min):
+            ax_enc.fill_between(lambdas, p_min, p_max, color=color, alpha=0.14, linewidth=0.0)
+        ax_rate.plot(lambdas, rate_nearest, color=color, lw=2.0, label=branch_label)
+        ax_enc.plot(lambdas, p_nearest, color=color, lw=2.0, label=branch_label)
 
-    axes[1].axhline(float(inverse["target_p_enc"]), color="black", ls=":", label="target p_enc")
-    axes[1].scatter([selected_lambda], [float(inverse["predicted_p_enc"])], s=70, color="gold", edgecolor="black", zorder=5)
-    axes[1].set_xlabel("lambda_I")
-    axes[1].set_ylabel("sum_k π_k^2")
-    axes[1].set_title("Encounter probability induced by π̄")
-    axes[1].legend(fontsize=8)
+    if all_lambdas:
+        data_min = float(min(all_lambdas))
+        data_max = float(max(all_lambdas))
+        left_span = 80.0 if selected_lambda <= 0.0 else 40.0
+        right_span = 40.0 if selected_lambda <= 0.0 else 80.0
+        x_min = max(data_min, selected_lambda - left_span)
+        x_max = min(data_max, selected_lambda + right_span)
+        if x_min < 0.0 < x_max:
+            pass
+        elif selected_lambda <= 0.0:
+            x_max = min(data_max, max(x_max, 5.0))
+        else:
+            x_min = max(data_min, min(x_min, -5.0))
+        ax_rate.set_xlim(x_min, x_max)
+        ax_enc.set_xlim(x_min, x_max)
 
-    axes[2].plot(series["t_axis"], series["informed_fraction"], lw=2.0, color="navy")
-    axes[2].set_ylim(-0.02, 1.02)
-    axes[2].set_xlabel("simulation step")
-    axes[2].set_ylabel("informed fraction")
-    axes[2].set_title(
-        f"Empirical spread at lambda_I={selected_lambda:+.0f}\n"
-        f"t90={empirical_point.time_to_90_percent}"
+    ax_rate.axhline(target_rate, color="black", ls=":", lw=1.7, label=r"target")
+    ax_rate.axvline(0.0, color="0.45", ls="-.", lw=1.0, label=r"neutral $\lambda_I=0$")
+    ax_rate.axvline(selected_lambda, color="crimson", ls="--", lw=1.3)
+    ax_rate.scatter([selected_lambda], [selected_rate], s=95, color="crimson", edgecolor="black", zorder=5)
+    ax_rate.set_xlabel(r"$\lambda_I$")
+    ax_rate.set_ylabel(r"mean-field rate $dn/dt$")
+    ax_rate.set_title("Rate matched by the nearest neutral multiplier")
+    ax_rate.grid(alpha=0.25)
+    ax_rate.legend(fontsize=8)
+    ax_rate.text(
+        0.03,
+        0.96,
+        rf"selected $\lambda_I={selected_lambda:.0f}$"
+        "\n"
+        rf"relative error={float(inverse['relative_rate_error']):.1e}",
+        transform=ax_rate.transAxes,
+        va="top",
+        ha="left",
+        fontsize=8.5,
+        bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "edgecolor": "0.8", "alpha": 0.92},
     )
 
-    fig.tight_layout()
+    ax_enc.axhline(target_p_enc, color="black", ls=":", lw=1.7, label=r"target")
+    ax_enc.axvline(0.0, color="0.45", ls="-.", lw=1.0, label=r"neutral $\lambda_I=0$")
+    ax_enc.axvline(selected_lambda, color="crimson", ls="--", lw=1.3)
+    ax_enc.scatter([selected_lambda], [selected_p_enc], s=95, color="crimson", edgecolor="black", zorder=5)
+    ax_enc.set_xlabel(r"$\lambda_I$")
+    ax_enc.set_ylabel(r"$p_{enc}=\sum_k \bar{\pi}_k^2$")
+    ax_enc.set_title("Encounter probability implied by the fixed point")
+    ax_enc.grid(alpha=0.25)
+    ax_enc.legend(fontsize=8)
+
+    t_axis = empirical_series["t_axis"]
+    cov_line = ax_age.plot(
+        t_axis,
+        empirical_series["mean_coverage_age"],
+        color="seagreen",
+        lw=2.0,
+        label=r"coverage age $A_C$",
+    )
+    ax_age.set_xlabel("simulation step")
+    ax_age.set_ylabel(r"mean coverage age $A_C$", color="seagreen")
+    ax_age.tick_params(axis="y", labelcolor="seagreen")
+    ax_age.grid(alpha=0.25)
+    ax_aoi = ax_age.twinx()
+    aoi_line = ax_aoi.plot(
+        t_axis,
+        empirical_series["mean_aoi"],
+        color="crimson",
+        lw=2.0,
+        label=r"Age of Information $\bar{\tau}$",
+    )
+    ax_aoi.set_ylabel(r"mean Age of Information $\bar{\tau}$", color="crimson")
+    ax_aoi.tick_params(axis="y", labelcolor="crimson")
+    ax_age.set_title(
+        "Age trade-off under the selected controller\n"
+        rf"final $A_C={empirical_point.final_mean_coverage_age:.1f}$, "
+        rf"final $\bar{{\tau}}={empirical_point.final_mean_aoi:.1f}$"
+    )
+    lines = cov_line + aoi_line
+    ax_age.legend(lines, [line.get_label() for line in lines], fontsize=8, loc="upper left")
+
+    ax_spread.plot(
+        t_axis,
+        empirical_series["informed_fraction"],
+        color="navy",
+        lw=2.0,
+        label="empirical informed fraction",
+    )
+    ax_spread.axhline(0.5, color="grey", ls=":", lw=1.0, label="50% / 90% thresholds")
+    ax_spread.axhline(0.9, color="grey", ls=":", lw=1.0)
+    if empirical_point.time_to_50_percent is not None:
+        ax_spread.axvline(empirical_point.time_to_50_percent, color="navy", ls="--", lw=1.0)
+    if empirical_point.time_to_90_percent is not None:
+        ax_spread.axvline(empirical_point.time_to_90_percent, color="navy", ls="--", lw=1.0)
+    ax_spread.set_ylim(-0.02, 1.02)
+    ax_spread.set_xlabel("simulation step")
+    ax_spread.set_ylabel("informed robot fraction")
+    ax_spread.set_title(
+        "Empirical spread under selected controller\n"
+        f"final={empirical_point.final_informed_fraction:.2f}, "
+        f"t50={empirical_point.time_to_50_percent}, "
+        f"t90={empirical_point.time_to_90_percent}, "
+        f"transmissions={empirical_point.total_transmission_events}"
+    )
+    ax_spread.grid(alpha=0.25)
+    ax_spread.legend(fontsize=8)
+
+    fig.suptitle(
+        r"Inverse information diffusion: match $dn/dt=A\beta p_{enc}f(1-f)$ with the nearest neutral multiplier"
+    )
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.94))
     fig.savefig(outdir / "maxcal_info_diffusion_validation_inverse_rate.png", dpi=140)
     plt.close(fig)
 
@@ -1039,7 +1168,7 @@ def make_information_meeting_maps_figure(outdir: Path, spread: Dict[str, object]
         fig.colorbar(im1, ax=axes[1, col], fraction=0.046)
 
     fig.suptitle("Where robots met and where information changed hands, log(1 + count)")
-    fig.tight_layout()
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.93))
     fig.savefig(outdir / "maxcal_info_diffusion_validation_meeting_maps.png", dpi=140)
     plt.close(fig)
 
@@ -1200,8 +1329,8 @@ def save_summary(
             "p_encounter_given_colocation": mid.P_ENCOUNTER_GIVEN_COLOCATION,
             "default_information_field_mode": mid.INFORMATION_FIELD_MODE,
             "age_observables": (
-                "Paper coverage age is the mean over cells of time since last physical visit. "
-                "Paper AoI tau is the time since a robot last exchanged information. "
+                "Coverage age is the mean over cells of time since last physical visit. "
+                "AoI tau is the time since a robot last exchanged information. "
                 "Robot maps additionally store last_visit_time[k] and last_map_record_time[k] "
                 "for local map freshness, but those cell-wise records are not tau."
             ),
@@ -1212,6 +1341,7 @@ def save_summary(
             "inverse_target_p_enc": args.inverse_target_p_enc,
             "inverse_branch": args.inverse_branch,
             "inverse_continuation_step": args.inverse_continuation_step,
+            "inverse_reference_lambda_I": args.inverse_reference_lambda_I,
             "seed": args.seed,
             "pure_stale_age": PURE_STALE_AGE,
         },
@@ -1254,7 +1384,7 @@ def save_summary(
                 "Fraction-informed curves and transmission heatmaps validate information diffusion "
                 "more directly than visit maps by measuring robot-level information spread, the number "
                 "of physical meetings that make communication possible, and where information-changing "
-                "encounters occurred. Paper AoI is tracked as time since exchange and is updated only "
+                "encounters occurred. AoI is tracked as time since exchange and is updated only "
                 "after successful communication; cell-wise map-record age is retained separately for "
                 "local map freshness."
             ),
@@ -1262,7 +1392,7 @@ def save_summary(
         "inverse_information_rate": inverse_summary,
     }
 
-    summary["layer1_i_ready_for_stage2"] = bool(
+    summary["information_diffusion_validation_ready"] = bool(
         kernel["zero_lambda_recovers_uniform_kernel"]
         and kernel["negative_lambda_prefers_high_information_neighbor"]
         and kernel["positive_lambda_penalizes_high_information_neighbor"]
@@ -1284,8 +1414,8 @@ def save_summary(
         and exchange["second_received_first_map_record"]
         and exchange["first_map_record_age_reset_for_received_record"]
         and exchange["second_map_record_age_reset_for_received_record"]
-        and exchange["first_paper_aoi_reset_after_exchange"]
-        and exchange["second_paper_aoi_reset_after_exchange"]
+        and exchange["first_aoi_reset_after_exchange"]
+        and exchange["second_aoi_reset_after_exchange"]
         and sweep["all_negative_increase_theoretical_p_enc_vs_zero"]
         and sweep["all_positive_reduce_theoretical_p_enc_vs_zero"]
         and spread["negative_generates_transmissions"]
@@ -1328,6 +1458,7 @@ def main() -> None:
         target_p_enc=args.inverse_target_p_enc,
         branch=args.inverse_branch,
         continuation_step=args.inverse_continuation_step,
+        reference_lambda_I=args.inverse_reference_lambda_I,
     )
 
     make_sign_sweep_figure(outdir, sweep)
@@ -1371,7 +1502,7 @@ def main() -> None:
             else (
                 f"negative->cluster={preview['negative_lambda_clusters_vs_zero']}, "
                 f"positive->coverage={preview['positive_lambda_preserves_coverage_vs_zero']}, "
-                f"negative lowers AoI={preview['negative_lambda_reduces_paper_aoi_vs_positive']}"
+                f"negative lowers AoI={preview['negative_lambda_reduces_aoi_vs_positive']}"
             )
         )
     )
@@ -1385,7 +1516,7 @@ def main() -> None:
     print(
         "  Inverse rate solve    : "
         f"target dn/dt={inverse['target_information_spreading_rate']:.5f}, "
-        f"lambda_I={inverse['lambda_I']:+.0f}, "
+        f"lambda_I={inverse['lambda_I']:+.3f}, "
         f"predicted dn/dt={inverse['predicted_information_spreading_rate']:.5f}, "
         f"converged={inverse['converged']}"
     )

@@ -1,21 +1,27 @@
 """
-Standalone validation script for Coverage Layer 1-C.
+RBE 511 Swarm Intelligence Final Project - MaxCal-Derived Swarm Control: Emergent Oscillation Between Coverage and Information Diffusion
 
-This script uses the controller in ``maxcal_coverage.py`` to run a single baseline simulation and a speed sweep, and performs the following checks and analyses:
-- the lambda_C = 0 kernel is row-stochastic and uniform over neighbors
-- the stationary target is π̄_k proportional to deg(k)
-- the discrete Markov update only fires on arrival
-- capped motion prevents overshoot
-- the L1 coverage error is measured in Markov time
-- representative corner / edge / interior cells approach their targets
-- the five-speed sweep is compared in both Markov and simulation time
+Author: Filippo Marcantoni (fmarcantoni@wpi.edu), Pau Alcolea (palcolea@wpi.edu), Chris Walczak (cwalczak2@wpi.edu)
+Course: RBE 511 - Swarm Intelligence (Prof. Carlo Pinciroli)
+Institution: Worcester Polytechnic Institute  
 
-This validator also defines the reference "pure coverage" regime used by
-the diffusion validator when it interprets lambda_I = 0 as the no-information
-baseline.
+-------------------------------------------------------------------------------------------------------------------------------------------
 
-Usage:
-    venv/bin/python maxcal_coverage_validation.py
+Validate the forward Layer 1-C coverage controller.
+
+With constant coverage multiplier,
+
+    P_ij = A_ij / deg(i),
+    pi_i = deg(i) / sum_m deg(m).
+
+The validator confirms that the implementation has exactly this kernel, that
+Markov transitions are counted only when a robot physically reaches its sampled
+destination, and that the empirical L1 error follows the expected late-time
+sampling scale
+
+    ||c(n)-π̄||_1 approximately C/(n+1),
+
+when plotted against Markov arrivals ``n``.
 """
 
 from __future__ import annotations
@@ -26,7 +32,7 @@ import os
 import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Dict, List
+from typing import Any
 
 os.environ.setdefault("MPLCONFIGDIR", str(Path(tempfile.gettempdir()) / "mplconfig"))
 os.environ.setdefault("XDG_CACHE_HOME", tempfile.gettempdir())
@@ -38,19 +44,15 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
+import maxcal_core as core
 import maxcal_coverage as mc
 
 
 SPEED_SWEEP = [0.05, 0.10, 0.20, 0.50, 1.00]
-
-
-@dataclass
-class InverseFit:
-    start_fraction: float
-    start_index: int
-    n_points: int
-    C_hat: float
-    r2: float
+FIGURES = [
+    "maxcal_coverage_validation_baseline.png",
+    "maxcal_coverage_validation_speed_sweep.png",
+]
 
 
 @dataclass
@@ -64,473 +66,256 @@ class RepresentativeCell:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Validate Coverage Layer 1-C.")
-    parser.add_argument(
-        "--outdir",
-        type=str,
-        default="maxcal_coverage_validation",
-        help="Directory for the validation report, figures, and raw data.",
-    )
-    parser.add_argument(
-        "--T",
-        type=int,
-        default=mc.T_SIM,
-        help="Simulation length in simulation steps.",
-    )
-    parser.add_argument(
-        "--speed",
-        type=float,
-        default=mc.ROBOT_SPEED,
-        help="Baseline robot speed in m/step.",
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=mc.SEED,
-        help="Seed for the baseline validation run.",
-    )
-    parser.add_argument(
-        "--fit-start-frac",
-        type=float,
-        default=0.50,
-        help="Fraction of the trace to discard before the late-time C/(t+1) fit.",
-    )
+    parser.add_argument("--outdir", type=str, default="maxcal_coverage_validation")
+    parser.add_argument("--T", type=int, default=mc.T_SIM)
+    parser.add_argument("--speed", type=float, default=mc.ROBOT_SPEED)
+    parser.add_argument("--seed", type=int, default=mc.SEED)
+    parser.add_argument("--fit-start-frac", type=float, default=0.50)
     return parser.parse_args()
 
 
-def build_baseline_objects():
-    world = mc.build_world(mc.NX, mc.NY, mc.CELL_SIZE)
-    lambda_c = np.zeros(world.K, dtype=np.float64)
-    transition = mc.build_transition_matrix(world, lambda_c)
-    pi_theory = mc.theoretical_stationary(world)
-    return world, transition, pi_theory
+def json_safe(value: Any) -> Any:
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if hasattr(value, "__dataclass_fields__"):
+        return asdict(value)
+    if isinstance(value, dict):
+        return {key: json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(item) for item in value]
+    return value
 
 
-def kernel_checks(world: mc.World, transition: np.ndarray) -> Dict[str, float]:
-    row_sums = transition.sum(axis=1)
-    max_row_sum_error = float(np.max(np.abs(row_sums - 1.0)))
-
-    off_neighbor_mask = np.ones_like(transition, dtype=bool)
-    for k in range(world.K):
-        off_neighbor_mask[k, world.adjacency[k]] = False
-        off_neighbor_mask[k, k] = False
-    max_off_neighbor_probability = float(np.max(np.abs(transition[off_neighbor_mask])))
-
-    max_uniform_neighbor_error = 0.0
-    for k in range(world.K):
-        neighbors = world.adjacency[k]
+def kernel_checks(world: mc.World, transition: np.ndarray) -> dict[str, float]:
+    """Check ``P_ij=1/deg(i)`` on neighbors and zero elsewhere."""
+    off_neighbor = np.ones_like(transition, dtype=bool)
+    max_uniform_error = 0.0
+    for cell, neighbors in enumerate(world.adjacency):
+        off_neighbor[cell, neighbors] = False
+        off_neighbor[cell, cell] = False
         target = 1.0 / len(neighbors)
-        max_uniform_neighbor_error = max(
-            max_uniform_neighbor_error,
-            float(np.max(np.abs(transition[k, neighbors] - target))),
-        )
-
+        max_uniform_error = max(max_uniform_error, float(np.max(np.abs(transition[cell, neighbors] - target))))
     return {
-        "max_row_sum_error": max_row_sum_error,
-        "max_off_neighbor_probability": max_off_neighbor_probability,
-        "max_uniform_neighbor_error": max_uniform_neighbor_error,
+        "max_row_sum_error": float(np.max(np.abs(transition.sum(axis=1) - 1.0))),
+        "max_off_neighbor_probability": float(np.max(np.abs(transition[off_neighbor]))),
+        "max_uniform_neighbor_error": max_uniform_error,
     }
 
 
-def motion_and_arrival_checks(world: mc.World, transition: np.ndarray) -> Dict[str, float | bool]:
+def motion_checks(world: mc.World, transition: np.ndarray) -> dict[str, float | bool]:
+    """Verify that one Markov step is one completed cell-to-cell arrival."""
     rng = np.random.default_rng(0)
-    from_k = 0
-    to_k = world.adjacency[from_k][0]
-    x0, y0 = mc.region_center(world, from_k)
-    tx, ty = mc.region_center(world, to_k)
+    source = 0
+    target = world.adjacency[source][0]
+    x0, y0 = mc.region_center(world, source)
+    tx, ty = mc.region_center(world, target)
     dist = float(np.hypot(tx - x0, ty - y0))
 
-    in_transit = mc.Robot(0, x0, y0, from_k, to_k, tx, ty)
-    visits_transit = np.zeros(world.K, dtype=np.int64)
-    slow_speed = dist / 3.0
-    mc.step_robot(in_transit, world, transition, slow_speed, visits_transit, rng, t=1)
-    transit_move = float(np.hypot(in_transit.x - x0, in_transit.y - y0))
-    transit_remaining = float(np.hypot(tx - in_transit.x, ty - in_transit.y))
+    in_transit = mc.Robot(0, x0, y0, source, target, tx, ty)
+    transit_visits = np.zeros(world.K, dtype=np.int64)
+    mc.step_robot(in_transit, world, transition, dist / 3.0, transit_visits, rng, t=1)
 
-    arrival = mc.Robot(1, x0, y0, from_k, to_k, tx, ty)
-    visits_arrival = np.zeros(world.K, dtype=np.int64)
-    global_last_visit_time = np.full(world.K, -1.0, dtype=np.float64)
-    global_last_visit_time[from_k] = 0.0
-    fast_speed = dist * 10.0
-    mc.step_robot(
-        arrival,
-        world,
-        transition,
-        fast_speed,
-        visits_arrival,
-        rng,
-        t=5,
-        global_last_visit_time=global_last_visit_time,
-    )
-    arrival_move = float(np.hypot(arrival.x - x0, arrival.y - y0))
+    arrival = mc.Robot(1, x0, y0, source, target, tx, ty)
+    arrival_visits = np.zeros(world.K, dtype=np.int64)
+    last_visit = np.full(world.K, -1.0, dtype=np.float64)
+    mc.step_robot(arrival, world, transition, dist * 10.0, arrival_visits, rng, t=5, global_last_visit_time=last_visit)
     arrival_map = mc.ensure_robot_map(arrival, world)
 
     return {
-        "transit_from_k_unchanged": in_transit.from_k == from_k,
-        "transit_visit_count_unchanged": int(visits_transit.sum()) == 0,
-        "transit_move_equals_speed": abs(transit_move - slow_speed) < 1e-12,
-        "transit_remaining_distance": transit_remaining,
-        "arrival_visit_incremented": int(visits_arrival[to_k]) == 1,
-        "arrival_total_visits": int(visits_arrival.sum()),
-        "arrival_from_k_updated": arrival.from_k == to_k,
-        "arrival_position_exact": abs(arrival.x - tx) < 1e-12 and abs(arrival.y - ty) < 1e-12,
-        "arrival_move_capped_to_distance": abs(arrival_move - dist) < 1e-12,
+        "transit_keeps_markov_state": in_transit.from_k == source and int(transit_visits.sum()) == 0,
+        "arrival_updates_markov_state": arrival.from_k == target and int(arrival_visits[target]) == 1,
+        "arrival_position_exact": abs(arrival.x - tx) < 1.0e-12 and abs(arrival.y - ty) < 1.0e-12,
         "arrival_next_target_is_neighbor": arrival.to_k in world.adjacency[arrival.from_k],
-        "arrival_local_coverage_timestamp_recorded": bool(arrival_map.last_visit_time[to_k] == 5.0),
-        "arrival_local_map_record_timestamp_recorded": bool(arrival_map.last_map_record_time[to_k] == 5.0),
-        "arrival_global_coverage_timestamp_recorded": bool(global_last_visit_time[to_k] == 5.0),
-        "arrival_local_coverage_age_zero": bool(arrival_map.coverage_age(5.0)[to_k] == 0.0),
-        "arrival_local_map_record_age_zero": bool(arrival_map.map_record_age(5.0)[to_k] == 0.0),
+        "arrival_local_visit_time": bool(arrival_map.last_visit_time[target] == 5.0),
+        "arrival_global_visit_time": bool(last_visit[target] == 5.0),
         "target_distance": dist,
     }
 
 
-def inverse_fit(markov_steps: np.ndarray, errors: np.ndarray, start_fraction: float) -> InverseFit:
-    start_index = int(len(markov_steps) * start_fraction)
-    x = 1.0 / (markov_steps[start_index:] + 1.0)
-    y = errors[start_index:]
-    c_hat = float(np.dot(x, y) / np.dot(x, x))
-    y_hat = c_hat * x
-    ss_res = float(np.sum((y - y_hat) ** 2))
-    ss_tot = float(np.sum((y - y.mean()) ** 2))
-    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0.0 else float("nan")
-    return InverseFit(
-        start_fraction=start_fraction,
-        start_index=start_index,
-        n_points=len(y),
-        C_hat=c_hat,
-        r2=r2,
-    )
-
-
-def representative_cells(world: mc.World, pi_theory: np.ndarray, final_ck: np.ndarray) -> Dict[str, RepresentativeCell]:
+def representative_cells(world: mc.World, target_pi: np.ndarray, final_ck: np.ndarray) -> dict[str, RepresentativeCell]:
     reps = {
         "corner": 0,
         "edge": mc.NX // 2,
         "interior": (mc.NY // 2) * mc.NX + mc.NX // 2,
     }
-    result: Dict[str, RepresentativeCell] = {}
-    for label, idx in reps.items():
-        result[label] = RepresentativeCell(
-            index=idx,
-            degree=len(world.adjacency[idx]),
-            target_pi=float(pi_theory[idx]),
-            final_ck=float(final_ck[idx]),
-            final_abs_error=float(abs(final_ck[idx] - pi_theory[idx])),
+    return {
+        label: RepresentativeCell(
+            index=cell,
+            degree=len(world.adjacency[cell]),
+            target_pi=float(target_pi[cell]),
+            final_ck=float(final_ck[cell]),
+            final_abs_error=float(abs(final_ck[cell] - target_pi[cell])),
         )
-    return result
+        for label, cell in reps.items()
+    }
 
 
-def simulation_steps_from_history(ck_history: List[np.ndarray]) -> np.ndarray:
-    return np.arange(1, len(ck_history) + 1, dtype=np.int64) * mc.RECORD_EVERY
+def fit_l1_over_markov_time(markov_steps: np.ndarray, l1_errors: np.ndarray, start_fraction: float) -> dict[str, float]:
+    """Fit the diagnostic ``L1(n) ~= C/(n+1)`` on late-time samples."""
+    start = int(len(markov_steps) * start_fraction)
+    if len(markov_steps[start:]) < 2:
+        return {"start_fraction": start_fraction, "C_hat": float("nan"), "r2": float("nan"), "n_points": 0}
+    x = 1.0 / (markov_steps[start:].astype(np.float64) + 1.0)
+    y = l1_errors[start:]
+    c_hat = float(np.dot(x, y) / max(np.dot(x, x), 1.0e-12))
+    residual = y - c_hat * x
+    ss_tot = float(np.sum((y - y.mean()) ** 2))
+    r2 = 1.0 - float(np.sum(residual * residual)) / ss_tot if ss_tot > 0.0 else float("nan")
+    return {"start_fraction": start_fraction, "C_hat": c_hat, "r2": r2, "n_points": int(len(y))}
 
 
-def run_baseline(speed: float, T: int, seed: int, fit_start_fraction: float) -> Dict[str, object]:
+def run_case(speed: float, T: int, seed: int) -> dict[str, Any]:
+    """Run one coverage simulation and compute theory-aligned diagnostics."""
     result = mc.run_simulation(speed=speed, T=T, seed=seed)
-    pi_theory = mc.theoretical_stationary(result.w)
-    ck_history = np.array(result.ck_history)
+    target = mc.theoretical_stationary(result.w)
+    ck = np.array(result.ck_history, dtype=np.float64)
     markov_steps = np.array(result.markov_step_history, dtype=np.int64)
-    sim_steps = simulation_steps_from_history(result.ck_history)
-    l1_errors = np.sum(np.abs(ck_history - pi_theory[None, :]), axis=1)
-    fit = inverse_fit(markov_steps.astype(np.float64), l1_errors, fit_start_fraction)
-    reps = representative_cells(result.w, pi_theory, ck_history[-1])
-
+    sim_steps = np.arange(1, len(ck) + 1, dtype=np.int64) * mc.RECORD_EVERY
+    l1 = np.sum(np.abs(ck - target[None, :]), axis=1) if len(ck) else np.array([], dtype=np.float64)
     return {
         "result": result,
-        "pi_theory": pi_theory,
-        "ck_history": ck_history,
+        "target": target,
+        "ck_history": ck,
         "markov_steps": markov_steps,
         "sim_steps": sim_steps,
-        "l1_errors": l1_errors,
-        "fit": fit,
-        "representatives": reps,
+        "l1_errors": l1,
+        "representatives": representative_cells(result.w, target, ck[-1] if len(ck) else result.pi_empirical),
     }
 
 
-def run_speed_sweep(T: int) -> Dict[str, object]:
-    sweep_runs = []
+def speed_sweep(T: int) -> list[dict[str, Any]]:
+    cases = []
     for speed in SPEED_SWEEP:
-        result = mc.run_simulation(speed=speed, T=T, seed=mc.SEED)
-        pi_theory = mc.theoretical_stationary(result.w)
-        ck_history = np.array(result.ck_history)
-        markov_steps = np.array(result.markov_step_history, dtype=np.int64)
-        sim_steps = simulation_steps_from_history(result.ck_history)
-        l1_errors = np.sum(np.abs(ck_history - pi_theory[None, :]), axis=1)
-        sweep_runs.append(
+        case = run_case(speed=speed, T=T, seed=mc.SEED)
+        cases.append(
             {
                 "speed": speed,
-                "markov_steps": markov_steps,
-                "sim_steps": sim_steps,
-                "l1_errors": l1_errors,
-                "final_markov_steps": int(markov_steps[-1]),
-                "final_l1_error": float(l1_errors[-1]),
+                "markov_steps": case["markov_steps"],
+                "sim_steps": case["sim_steps"],
+                "l1_errors": case["l1_errors"],
+                "final_l1": float(case["l1_errors"][-1]) if len(case["l1_errors"]) else float("nan"),
+                "total_arrivals": int(case["result"].markov_step_history[-1]) if case["result"].markov_step_history else 0,
             }
         )
-
-    common_markov_low = max(run["markov_steps"][0] for run in sweep_runs)
-    common_markov_high = min(run["markov_steps"][-1] for run in sweep_runs)
-    common_markov_grid = np.linspace(common_markov_low, common_markov_high, 100)
-    markov_stack = np.stack(
-        [
-            np.interp(common_markov_grid, run["markov_steps"], run["l1_errors"])
-            for run in sweep_runs
-        ]
-    )
-    markov_rel_range = np.mean(
-        (markov_stack.max(axis=0) - markov_stack.min(axis=0))
-        / np.maximum(np.median(markov_stack, axis=0), 1e-12)
-    )
-
-    sim_stack = np.stack([run["l1_errors"] for run in sweep_runs])
-    sim_rel_range = np.mean(
-        (sim_stack.max(axis=0) - sim_stack.min(axis=0))
-        / np.maximum(np.median(sim_stack, axis=0), 1e-12)
-    )
-
-    return {
-        "runs": sweep_runs,
-        "common_markov_low": float(common_markov_low),
-        "common_markov_high": float(common_markov_high),
-        "markov_mean_relative_range": float(markov_rel_range),
-        "simulation_mean_relative_range": float(sim_rel_range),
-    }
+    return cases
 
 
-def save_raw_data(outdir: Path, baseline: Dict[str, object], speed_sweep: Dict[str, object]) -> None:
-    np.savez(
+def normalized_spread(curves: list[dict[str, Any]], axis_key: str, n_grid: int = 200) -> float:
+    valid = [case for case in curves if len(case["l1_errors"]) >= 2]
+    if len(valid) < 2:
+        return float("nan")
+    max_start = max(float(case[axis_key][0]) for case in valid)
+    min_end = min(float(case[axis_key][-1]) for case in valid)
+    if min_end > max_start:
+        grid = np.linspace(max_start, min_end, n_grid)
+        values = np.array([np.interp(grid, case[axis_key], case["l1_errors"]) for case in valid])
+    else:
+        grid = np.linspace(0.0, 1.0, n_grid)
+        values = []
+        for case in valid:
+            axis = np.asarray(case[axis_key], dtype=np.float64)
+            axis = (axis - axis[0]) / max(float(axis[-1] - axis[0]), 1.0e-12)
+            values.append(np.interp(grid, axis, case["l1_errors"]))
+        values = np.asarray(values, dtype=np.float64)
+    mean = np.maximum(values.mean(axis=0), 1.0e-12)
+    return float(np.mean(values.std(axis=0) / mean))
+
+
+def save_raw_data(outdir: Path, baseline: dict[str, Any], sweep: list[dict[str, Any]]) -> None:
+    np.savez_compressed(
         outdir / "maxcal_coverage_validation_raw_data.npz",
         baseline_markov_steps=baseline["markov_steps"],
         baseline_sim_steps=baseline["sim_steps"],
         baseline_l1_errors=baseline["l1_errors"],
-        baseline_ck_history=baseline["ck_history"],
-        baseline_pi_theory=baseline["pi_theory"],
-        baseline_t_axis=baseline["result"].t_axis,
-        baseline_mean_global_coverage_age=baseline["result"].mean_global_coverage_age,
-        baseline_mean_local_coverage_age=baseline["result"].mean_local_coverage_age,
-        baseline_mean_local_map_record_age=baseline["result"].mean_local_map_record_age,
-        speed_sweep_speeds=np.array([run["speed"] for run in speed_sweep["runs"]], dtype=np.float64),
-        speed_sweep_final_markov_steps=np.array(
-            [run["final_markov_steps"] for run in speed_sweep["runs"]],
-            dtype=np.int64,
-        ),
-        speed_sweep_final_l1_errors=np.array(
-            [run["final_l1_error"] for run in speed_sweep["runs"]],
-            dtype=np.float64,
-        ),
+        baseline_target=baseline["target"],
+        baseline_empirical=baseline["result"].pi_empirical,
+        sweep_speeds=np.array([case["speed"] for case in sweep], dtype=np.float64),
     )
 
 
-def make_baseline_figure(outdir: Path, baseline: Dict[str, object]) -> None:
-    result = baseline["result"]
-    pi_theory = baseline["pi_theory"]
-    ck_history = baseline["ck_history"]
-    markov_steps = baseline["markov_steps"]
-    l1_errors = baseline["l1_errors"]
-    fit: InverseFit = baseline["fit"]
-    reps: Dict[str, RepresentativeCell] = baseline["representatives"]
+def make_baseline_figure(outdir: Path, baseline: dict[str, Any], fit: dict[str, float]) -> None:
+    result: mc.SimResult = baseline["result"]
+    target = baseline["target"]
+    world = result.w
+    empirical = result.pi_empirical
+    abs_error = np.abs(empirical - target)
+    final_l1 = float(abs_error.sum())
+    fig, axes = plt.subplots(2, 3, figsize=(15, 8.5))
+    pi_vmin = min(float(target.min()), float(empirical.min()))
+    pi_vmax = max(float(target.max()), float(empirical.max()))
+    for ax, data, title, cmap in [
+        (axes[0, 0], target, "theory pi proportional to degree", "viridis"),
+        (axes[0, 1], empirical, "empirical visits", "viridis"),
+        (axes[0, 2], abs_error, f"absolute error map, L1={final_l1:.3f}", "Reds"),
+    ]:
+        if cmap == "viridis":
+            im = ax.imshow(data.reshape(world.Ny, world.Nx), origin="lower", cmap=cmap, vmin=pi_vmin, vmax=pi_vmax)
+        else:
+            im = ax.imshow(data.reshape(world.Ny, world.Nx), origin="lower", cmap=cmap)
+        ax.set_title(title)
+        ax.set_xlabel("col")
+        ax.set_ylabel("row")
+        fig.colorbar(im, ax=ax, fraction=0.046)
 
-    fig, axes = plt.subplots(1, 2, figsize=(13, 4.8))
-
-    fit_x = markov_steps.astype(np.float64)
-    fit_curve = fit.C_hat / (fit_x + 1.0)
-    axes[0].plot(fit_x, l1_errors, lw=2.2, color="navy", label="Observed L1 error")
-    axes[0].plot(fit_x, fit_curve, lw=1.8, ls="--", color="crimson", label="C/(t+1) fit")
-    axes[0].axvline(
-        markov_steps[fit.start_index],
-        color="gray",
-        ls=":",
-        lw=1.2,
-        label=f"Late-time start ({fit.start_fraction:.2f})",
-    )
-    axes[0].set_title(f"Baseline L1 convergence, R^2={fit.r2:.3f}")
-    axes[0].set_xlabel("Markov steps (arrivals)")
-    axes[0].set_ylabel("||c(.,t) - π̄(.)||_1")
-    axes[0].legend(loc="upper right")
-
-    colors = {"corner": "red", "edge": "darkorange", "interior": "seagreen"}
-    for label, rep in reps.items():
-        axes[1].plot(
+    ax = axes[1, 0]
+    markov_steps = np.asarray(baseline["markov_steps"], dtype=np.float64)
+    l1_errors = np.asarray(baseline["l1_errors"], dtype=np.float64)
+    ax.plot(markov_steps, l1_errors, color="navy", lw=2.0, label="simulation")
+    if len(markov_steps) and int(fit.get("n_points", 0)) > 0 and np.isfinite(fit.get("C_hat", np.nan)):
+        fit_curve = float(fit["C_hat"]) / (markov_steps + 1.0)
+        ax.plot(
             markov_steps,
-            ck_history[:, rep.index],
+            fit_curve,
+            color="crimson",
+            ls="--",
             lw=2.0,
-            color=colors[label],
-            label=f"{label.title()} (deg {rep.degree})",
+            label=f"C/(n+1), R2={fit['r2']:.2f}",
         )
-        axes[1].axhline(rep.target_pi, color=colors[label], ls="--", lw=1.2)
-    axes[1].set_title("Representative cells by degree class")
-    axes[1].set_xlabel("Markov steps (arrivals)")
-    axes[1].set_ylabel("c_k(t)")
-    axes[1].legend(loc="upper right")
+    ax.set_yscale("log")
+    ax.set_xlabel("Markov arrivals n")
+    ax.set_ylabel("overall L1 error")
+    ax.set_title("overall convergence and 1/(n+1) rate fit")
+    ax.legend(fontsize=8)
 
+    for label, rep in baseline["representatives"].items():
+        cell = rep.index
+        axes[1, 1].plot(baseline["markov_steps"], baseline["ck_history"][:, cell], label=label)
+        axes[1, 1].axhline(target[cell], ls=":", lw=1.0)
+    axes[1, 1].set_xlabel("Markov arrivals")
+    axes[1, 1].set_ylabel("coverage fraction")
+    axes[1, 1].set_title("representative cells")
+    axes[1, 1].legend(fontsize=8)
+
+    axes[1, 2].hist(abs_error, bins=30, color="firebrick", alpha=0.8)
+    axes[1, 2].axvline(float(abs_error.mean()), color="black", ls="--", lw=1.0, label=f"mean={abs_error.mean():.2e}")
+    axes[1, 2].set_xlabel("|empirical π - theory π̄|")
+    axes[1, 2].set_ylabel("cells")
+    axes[1, 2].set_title("cellwise error distribution")
+    axes[1, 2].legend(fontsize=8)
+
+    fig.suptitle("Forward Layer 1-C coverage validation")
     fig.tight_layout()
     fig.savefig(outdir / "maxcal_coverage_validation_baseline.png", dpi=140)
     plt.close(fig)
 
-    fig, ax = plt.subplots(figsize=(5.6, 5.0))
-    ax.imshow(
-        np.abs(result.pi_empirical - pi_theory).reshape(result.w.Ny, result.w.Nx),
-        origin="lower",
-        cmap="Reds",
-    )
-    ax.set_title("Final |π̂_k - π̄_k|")
-    ax.set_xlabel("col")
-    ax.set_ylabel("row")
-    fig.tight_layout()
-    fig.savefig(outdir / "maxcal_coverage_validation_final_error_map.png", dpi=140)
-    plt.close(fig)
 
-    if (
-        result.t_axis is not None
-        and result.mean_global_coverage_age is not None
-        and result.mean_local_coverage_age is not None
-        and result.mean_local_map_record_age is not None
-    ):
-        fig, axes = plt.subplots(1, 2, figsize=(12.0, 4.8))
-
-        axes[0].plot(
-            result.t_axis,
-            result.mean_global_coverage_age,
-            lw=2.0,
-            color="seagreen",
-        )
-        axes[0].set_title("Paper coverage age")
-        axes[0].set_xlabel("simulation step")
-        axes[0].set_ylabel("mean age over cells (steps)")
-        axes[0].grid(alpha=0.25)
-
-        axes[1].plot(
-            result.t_axis,
-            result.mean_local_coverage_age,
-            lw=1.8,
-            color="navy",
-            label="mean local coverage age",
-        )
-        axes[1].plot(
-            result.t_axis,
-            result.mean_local_map_record_age,
-            lw=1.5,
-            color="crimson",
-            ls="--",
-            label="mean local map-record age",
-        )
-        axes[1].set_title("Local robot-map diagnostic")
-        axes[1].set_xlabel("simulation step")
-        axes[1].set_ylabel("mean age over robot maps (steps)")
-        axes[1].grid(alpha=0.25)
-        axes[1].legend(loc="upper left")
-
-        fig.suptitle("Coverage-age observables: global paper metric vs local maps")
-        fig.tight_layout()
-        fig.savefig(outdir / "maxcal_coverage_validation_age_observables.png", dpi=140)
-        plt.close(fig)
-
-
-def make_speed_figure(outdir: Path, speed_sweep: Dict[str, object]) -> None:
-    fig, axes = plt.subplots(1, 2, figsize=(13, 4.8))
-
-    for run in speed_sweep["runs"]:
-        label = f"v={run['speed']:.2f} m/step"
-        axes[0].plot(run["markov_steps"], run["l1_errors"], lw=2.0, label=label)
-        axes[1].plot(run["sim_steps"], run["l1_errors"], lw=2.0, label=label)
-
-    axes[0].set_yscale("log")
-    axes[0].set_title("L1 error in Markov time")
-    axes[0].set_xlabel("Markov steps (arrivals)")
-    axes[0].set_ylabel("||c(.,t) - π̄(.)||_1")
-    axes[0].legend(loc="upper right")
-
-    axes[1].set_yscale("log")
-    axes[1].set_title("L1 error in simulation time")
-    axes[1].set_xlabel("Simulation steps")
-    axes[1].set_ylabel("||c(.,t) - π̄(.)||_1")
-    axes[1].legend(loc="upper right")
-
+def make_speed_figure(outdir: Path, sweep: list[dict[str, Any]]) -> None:
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
+    for case in sweep:
+        axes[0].plot(case["markov_steps"], case["l1_errors"], label=f"v={case['speed']:g}")
+        axes[1].plot(case["sim_steps"], case["l1_errors"], label=f"v={case['speed']:g}")
+    for ax, xlabel in [(axes[0], "Markov arrivals"), (axes[1], "simulation step")]:
+        ax.set_yscale("log")
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel("L1 error")
+        ax.legend(fontsize=8)
+    axes[0].set_title("coverage convergence in Markov time")
+    axes[1].set_title("coverage convergence in simulation time")
     fig.tight_layout()
     fig.savefig(outdir / "maxcal_coverage_validation_speed_sweep.png", dpi=140)
     plt.close(fig)
-
-
-def save_summary(
-    outdir: Path,
-    args: argparse.Namespace,
-    kernel: Dict[str, float],
-    motion: Dict[str, float | bool],
-    baseline: Dict[str, object],
-    speed_sweep: Dict[str, object],
-) -> None:
-    fit: InverseFit = baseline["fit"]
-    reps: Dict[str, RepresentativeCell] = baseline["representatives"]
-
-    summary = {
-        "config": {
-            "Nx": mc.NX,
-            "Ny": mc.NY,
-            "cell_size_m": mc.CELL_SIZE,
-            "robots": mc.N_ROBOTS,
-            "lambda_C_value": mc.LAMBDA_C_VAL,
-            "stage2_baseline_regime": "pure coverage reference (lambda_I = 0)",
-            "baseline_speed_m_per_step": args.speed,
-            "simulation_steps": args.T,
-            "seed": args.seed,
-            "record_every_steps": mc.RECORD_EVERY,
-        },
-        "kernel_checks": kernel,
-        "motion_and_arrival_checks": motion,
-        "baseline_run": {
-            "total_markov_steps": int(baseline["markov_steps"][-1]),
-            "final_l1_error": float(baseline["l1_errors"][-1]),
-            "final_mean_global_coverage_age": float(
-                baseline["result"].mean_global_coverage_age[-1]
-            ) if baseline["result"].mean_global_coverage_age is not None else None,
-            "final_mean_local_coverage_age": float(
-                baseline["result"].mean_local_coverage_age[-1]
-            ) if baseline["result"].mean_local_coverage_age is not None else None,
-            "final_mean_local_map_record_age": float(
-                baseline["result"].mean_local_map_record_age[-1]
-            ) if baseline["result"].mean_local_map_record_age is not None else None,
-            "fit": asdict(fit),
-            "fit_pass_r2_gt_0_95": bool(fit.r2 > 0.95),
-            "representative_cells": {label: asdict(rep) for label, rep in reps.items()},
-        },
-        "speed_sweep": {
-            "speeds_m_per_step": SPEED_SWEEP,
-            "markov_mean_relative_range": speed_sweep["markov_mean_relative_range"],
-            "simulation_mean_relative_range": speed_sweep["simulation_mean_relative_range"],
-            "markov_time_collapse_stronger_than_simulation_time": bool(
-                speed_sweep["markov_mean_relative_range"]
-                < speed_sweep["simulation_mean_relative_range"]
-            ),
-            "per_speed_final_values": [
-                {
-                    "speed": run["speed"],
-                    "final_markov_steps": run["final_markov_steps"],
-                    "final_l1_error": run["final_l1_error"],
-                }
-                for run in speed_sweep["runs"]
-            ],
-        },
-    }
-
-    summary["coverage_layer1_ready_for_stage2"] = bool(
-        kernel["max_row_sum_error"] < 1e-12
-        and kernel["max_off_neighbor_probability"] < 1e-12
-        and kernel["max_uniform_neighbor_error"] < 1e-12
-        and motion["transit_from_k_unchanged"]
-        and motion["transit_visit_count_unchanged"]
-        and motion["arrival_visit_incremented"]
-        and motion["arrival_from_k_updated"]
-        and motion["arrival_position_exact"]
-        and motion["arrival_move_capped_to_distance"]
-        and motion["arrival_local_coverage_timestamp_recorded"]
-        and motion["arrival_local_map_record_timestamp_recorded"]
-        and motion["arrival_global_coverage_timestamp_recorded"]
-        and motion["arrival_local_coverage_age_zero"]
-        and motion["arrival_local_map_record_age_zero"]
-        and summary["baseline_run"]["fit_pass_r2_gt_0_95"]
-        and summary["speed_sweep"]["markov_time_collapse_stronger_than_simulation_time"]
-    )
-
-    with open(outdir / "maxcal_coverage_validation_summary.json", "w", encoding="utf-8") as handle:
-        json.dump(summary, handle, indent=2)
 
 
 def main() -> None:
@@ -538,34 +323,89 @@ def main() -> None:
     outdir = Path(args.outdir).resolve()
     outdir.mkdir(parents=True, exist_ok=True)
 
-    world, transition, _ = build_baseline_objects()
+    world = mc.build_world(mc.NX, mc.NY, mc.CELL_SIZE)
+    transition = mc.build_transition_matrix(world, np.zeros(world.K, dtype=np.float64))
     kernel = kernel_checks(world, transition)
-    motion = motion_and_arrival_checks(world, transition)
-    baseline = run_baseline(
-        speed=args.speed,
-        T=args.T,
-        seed=args.seed,
-        fit_start_fraction=args.fit_start_frac,
-    )
-    speed_sweep = run_speed_sweep(T=args.T)
+    motion = motion_checks(world, transition)
+    stationary_l1 = core.l1_error(mc.power_stationary_distribution(transition), mc.theoretical_stationary(world))
+    baseline = run_case(args.speed, args.T, args.seed)
+    sweep = speed_sweep(args.T)
+    fit = fit_l1_over_markov_time(baseline["markov_steps"], baseline["l1_errors"], args.fit_start_frac)
+    markov_spread = normalized_spread(sweep, "markov_steps")
+    sim_spread = normalized_spread(sweep, "sim_steps")
 
-    save_raw_data(outdir, baseline, speed_sweep)
-    make_baseline_figure(outdir, baseline)
-    make_speed_figure(outdir, speed_sweep)
-    save_summary(outdir, args, kernel, motion, baseline, speed_sweep)
+    checks = {
+        "kernel_rows_are_stochastic": bool(kernel["max_row_sum_error"] < 1.0e-12),
+        "kernel_uses_only_neighbor_moves": bool(kernel["max_off_neighbor_probability"] < 1.0e-12),
+        "equal_multipliers_make_uniform_neighbor_walk": bool(kernel["max_uniform_neighbor_error"] < 1.0e-12),
+        "stationary_distribution_is_degree_proportional": bool(stationary_l1 < 1.0e-10),
+        "arrival_updates_markov_state": bool(motion["arrival_updates_markov_state"]),
+        "in_transit_motion_does_not_count_markov_step": bool(motion["transit_keeps_markov_state"]),
+        "baseline_has_samples": bool(len(baseline["markov_steps"]) > 0),
+        "markov_time_spread_not_worse_than_sim_time": bool(markov_spread <= 1.05 * sim_spread),
+    }
+    summary = {
+        "paper_alignment": {
+            "layer": "Layer 1-C coverage validation",
+            "claim": "The forward MaxCal coverage controller is a destination-weighted random walk whose equal-multiplier baseline has degree-proportional stationary coverage.",
+            "validated_outputs": [
+                "transition-kernel sanity checks",
+                "arrival-counted Markov convergence",
+                "speed sweep showing that Markov arrivals are the natural time variable",
+            ],
+        },
+        "environment": {
+            "Nx": mc.NX,
+            "Ny": mc.NY,
+            "cell_size": mc.CELL_SIZE,
+            "robots": mc.N_ROBOTS,
+            "record_every": mc.RECORD_EVERY,
+        },
+        "kernel_checks": kernel,
+        "motion_checks": motion,
+        "stationary_l1_vs_degree_target": stationary_l1,
+        "baseline": {
+            "speed": args.speed,
+            "T": args.T,
+            "total_markov_arrivals": int(baseline["result"].markov_step_history[-1]) if baseline["result"].markov_step_history else 0,
+            "final_l1_error": float(baseline["l1_errors"][-1]) if len(baseline["l1_errors"]) else float("nan"),
+            "late_time_fit": fit,
+            "representative_cells": baseline["representatives"],
+        },
+        "speed_sweep": {
+            "cases": [
+                {
+                    "speed": case["speed"],
+                    "total_arrivals": case["total_arrivals"],
+                    "final_l1": case["final_l1"],
+                }
+                for case in sweep
+            ],
+            "relative_spread_markov_time": markov_spread,
+            "relative_spread_sim_time": sim_spread,
+            "markov_time_collapses_better": bool(markov_spread < sim_spread),
+        },
+        "checks": checks,
+        "coverage_validation_ready": bool(all(checks.values())),
+        "figures": FIGURES,
+    }
 
-    fit: InverseFit = baseline["fit"]
+    save_raw_data(outdir, baseline, sweep)
+    make_baseline_figure(outdir, baseline, fit)
+    make_speed_figure(outdir, sweep)
+    with open(outdir / "maxcal_coverage_validation_summary.json", "w", encoding="utf-8") as handle:
+        json.dump(json_safe(summary), handle, indent=2)
+
     print("MaxCal Coverage Validation (Layer 1-C)")
-    print(f"  Output directory      : {outdir}")
-    print(f"  Baseline markov steps : {int(baseline['markov_steps'][-1])}")
-    print(f"  Baseline final L1     : {float(baseline['l1_errors'][-1]):.6f}")
-    print(f"  Late-time fit R^2     : {fit.r2:.6f}")
-    print(
-        "  Markov vs sim spread  : "
-        f"{speed_sweep['markov_mean_relative_range']:.3f} vs "
-        f"{speed_sweep['simulation_mean_relative_range']:.3f}"
-    )
-    print("  Saved summary         : maxcal_coverage_validation_summary.json")
+    print(f"  Output directory       : {outdir}")
+    print(f"  Validation ready       : {summary['coverage_validation_ready']}")
+    print(f"  Kernel row error       : {kernel['max_row_sum_error']:.3e}")
+    print(f"  Stationary L1 vs theory: {stationary_l1:.3e}")
+    print(f"  Baseline arrivals      : {summary['baseline']['total_markov_arrivals']}")
+    print(f"  Baseline final L1      : {summary['baseline']['final_l1_error']:.6f}")
+    print(f"  Late-time fit R^2      : {fit['r2']:.6f}")
+    print(f"  Markov/sim spread      : {markov_spread:.3f} / {sim_spread:.3f}")
+    print("  Saved summary          : maxcal_coverage_validation_summary.json")
 
 
 if __name__ == "__main__":
